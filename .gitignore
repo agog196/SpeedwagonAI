@@ -1,0 +1,11 @@
+.rocketride/
+.env
+.venv/
+data/
+audio/
+notes/
+transcripts/
+models/
+*.egg-info/
+__pycache__/
+*.py[cod]
