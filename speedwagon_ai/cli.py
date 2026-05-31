@@ -4,6 +4,8 @@ import argparse
 import shutil
 from pathlib import Path
 
+from speedwagon_ai.assistant_actions import run_action
+from speedwagon_ai.assistant_commands import execute_command
 from speedwagon_ai.capture import Recorder
 from speedwagon_ai.app import run_app
 from speedwagon_ai.config import Settings
@@ -39,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     app_parser.add_argument("--port", type=int)
     app_parser.set_defaults(func=cmd_app)
 
+    ask_parser = subparsers.add_parser("ask", help="Run a one-line SpeedwagonAI assistant command.")
+    ask_parser.add_argument("command")
+    ask_parser.set_defaults(func=cmd_ask)
+
     record_parser = subparsers.add_parser("record", help="Start or stop local audio recording.")
     record_sub = record_parser.add_subparsers(dest="record_command", required=True)
     record_start = record_sub.add_parser("start", help="Start recording with macOS afrecord.")
@@ -67,6 +73,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     commitments_parser = subparsers.add_parser("commitments", help="Regenerate and print open commitments.")
     commitments_parser.set_defaults(func=cmd_commitments)
+
+    tasks_parser = subparsers.add_parser("tasks", help="List and manage local tasks.")
+    tasks_sub = tasks_parser.add_subparsers(dest="tasks_command")
+    tasks_parser.set_defaults(func=cmd_tasks_list)
+    overdue_parser = tasks_sub.add_parser("overdue", help="List overdue tasks.")
+    overdue_parser.set_defaults(func=cmd_tasks_overdue)
+    complete_parser = tasks_sub.add_parser("complete", help="Mark a task complete.")
+    complete_parser.add_argument("task_id", type=int)
+    complete_parser.set_defaults(func=cmd_tasks_complete)
+    reopen_parser = tasks_sub.add_parser("reopen", help="Reopen a completed task.")
+    reopen_parser.add_argument("task_id", type=int)
+    reopen_parser.set_defaults(func=cmd_tasks_reopen)
+    add_parser = tasks_sub.add_parser("add", help="Add a manual task.")
+    add_parser.add_argument("text")
+    add_parser.add_argument("--owner")
+    add_parser.add_argument("--due")
+    add_parser.set_defaults(func=cmd_tasks_add)
 
     gmail_parser = subparsers.add_parser("gmail", help="Gmail integrations.")
     gmail_sub = gmail_parser.add_subparsers(dest="gmail_command", required=True)
@@ -104,6 +127,22 @@ def cmd_app(args: argparse.Namespace, settings: Settings, repo: Repository) -> i
     repo.init()
     run_app(settings, repo, host=args.host or settings.app_host, port=args.port or settings.app_port)
     return 0
+
+
+def cmd_ask(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    response = execute_command(settings, repo, args.command)
+    print(response["summary"])
+    result = response.get("result") or {}
+    if "tasks" in result:
+        print_tasks(result["tasks"])
+    elif "task" in result:
+        print_tasks([result["task"]])
+        MarkdownWriter(settings, repo).write_commitments()
+    elif "markdown" in result:
+        print()
+        print(result["markdown"])
+    return 0 if response["supported"] else 1
 
 
 def cmd_record_start(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
@@ -161,6 +200,54 @@ def cmd_commitments(args: argparse.Namespace, settings: Settings, repo: Reposito
     print(path.read_text(encoding="utf-8"))
     print(f"\nWrote {path}")
     return 0
+
+
+def cmd_tasks_list(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    print_tasks(repo.list_tasks(status="open"))
+    return 0
+
+
+def cmd_tasks_overdue(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    print_tasks(run_action(settings, repo, "list_overdue_tasks")["tasks"])
+    return 0
+
+
+def cmd_tasks_complete(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    task = repo.complete_task(args.task_id)
+    MarkdownWriter(settings, repo).write_commitments()
+    print(f"Completed task {task['id']}: {task['text']}")
+    return 0
+
+
+def cmd_tasks_reopen(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    task = repo.reopen_task(args.task_id)
+    MarkdownWriter(settings, repo).write_commitments()
+    print(f"Reopened task {task['id']}: {task['text']}")
+    return 0
+
+
+def cmd_tasks_add(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    task = repo.create_task(args.text, owner=args.owner, due_date=args.due)
+    MarkdownWriter(settings, repo).write_commitments()
+    print(f"Added task {task['id']}: {task['text']}")
+    return 0
+
+
+def print_tasks(tasks: list[dict]) -> None:
+    if not tasks:
+        print("No tasks.")
+        return
+    for task in tasks:
+        due = f" due {task['due_date']}" if task.get("due_date") else ""
+        owner = task.get("owner") or "unassigned"
+        source = task.get("meeting_title") or task.get("source")
+        marker = "!" if task.get("is_overdue") else "-"
+        print(f"{marker} [{task['id']}] {task['text']} ({owner}{due}; {source})")
 
 
 def cmd_gmail_draft(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:

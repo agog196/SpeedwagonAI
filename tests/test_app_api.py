@@ -104,6 +104,37 @@ class AppApiTests(unittest.TestCase):
         self.assertFalse(settings["openai_key_present"])
         self.assertIn("recorder_status", settings)
 
+    def test_task_api_create_complete_reopen_and_overdue(self) -> None:
+        created = self.post_json(
+            "/api/tasks",
+            {"text": "Send task API notes", "owner": "Anish", "due_date": "2020-01-01"},
+        )
+        task_id = created["task"]["id"]
+        tasks = self.get_json("/api/tasks?status=&include_done=true")
+        self.assertTrue(any(task["id"] == task_id for task in tasks["tasks"]))
+
+        overdue = self.get_json("/api/tasks/overdue")
+        self.assertTrue(any(task["id"] == task_id for task in overdue["tasks"]))
+
+        completed = self.post_json(f"/api/tasks/{task_id}/complete", {})
+        self.assertEqual(completed["task"]["status"], "done")
+
+        reopened = self.post_json(f"/api/tasks/{task_id}/reopen", {})
+        self.assertEqual(reopened["task"]["status"], "open")
+
+    def test_assistant_action_api(self) -> None:
+        self.post_json("/api/tasks", {"text": "Overdue action", "due_date": "2020-01-01"})
+        result = self.post_json("/api/actions", {"action": "list_overdue_tasks", "payload": {}})
+        self.assertTrue(any(task["text"] == "Overdue action" for task in result["tasks"]))
+
+    def test_assistant_command_api(self) -> None:
+        added = self.post_json("/api/assistant/command", {"command": "add task write API notes due 2026-06-01"})
+        self.assertEqual(added["action"], "add_task")
+        task_id = added["result"]["task"]["id"]
+
+        completed = self.post_json("/api/assistant/command", {"command": f"complete task {task_id}"})
+        self.assertEqual(completed["result"]["task"]["status"], "done")
+
     def get_json(self, path: str) -> dict:
         with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))

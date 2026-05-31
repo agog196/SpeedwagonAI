@@ -19,6 +19,7 @@ speedwagon record stop
 speedwagon process <meeting-id>
 speedwagon context --topic "weekly planning"
 speedwagon commitments
+speedwagon tasks
 speedwagon app
 ```
 
@@ -40,6 +41,34 @@ speedwagon app
 ```
 
 The app runs at `http://127.0.0.1:8765` by default and uses the same local SQLite database as the CLI.
+
+## Tasks
+
+SpeedwagonAI mirrors extracted action items and commitments into a unified local task inbox.
+
+```bash
+speedwagon tasks
+speedwagon tasks overdue
+speedwagon tasks add "Send revised follow-up" --due 2026-06-01
+speedwagon tasks complete <task-id>
+speedwagon tasks reopen <task-id>
+```
+
+The local app also has a Tasks screen for completing, reopening, and reviewing overdue work.
+
+## Assistant Commands
+
+Run deterministic one-line commands:
+
+```bash
+speedwagon ask "what is overdue"
+speedwagon ask "what should I do today"
+speedwagon ask "add task send notes due 2026-06-01"
+speedwagon ask "complete task 12"
+speedwagon ask "search context for onboarding"
+```
+
+The local app dashboard includes the same command box. V5 uses local rules only, with a parser boundary designed for a future LLM parser.
 
 ## Gmail Draft Instructions
 

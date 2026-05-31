@@ -14,6 +14,7 @@ SpeedwagonAI is currently a local Python engine with a browser UI and HTTP API. 
 - Menu bar or compact command UI for quick capture, context lookup, and follow-up drafting.
 - macOS notifications for due or overdue commitments.
 - Apple Reminders integration for confirmed commitments.
+- A SwiftUI task inbox backed by the local `/api/tasks` endpoints.
 - ScreenCaptureKit-based meeting/system audio capture as a cleaner long-term alternative to virtual routing.
 - Apple Mail / Outlook / Gmail provider adapters.
 - Google Drive / Docs editing through explicit user-approved integrations.
@@ -44,3 +45,9 @@ sudo xcodebuild -license accept
 ```
 
 Do this only when you are ready to start native Mac development.
+
+## Local API Boundary
+
+The local web UI and future SwiftUI app should share the same assistant/task API. See [Local API Reference](local-api.md).
+
+The `/api/assistant/command` endpoint is the intended first boundary for a future SwiftUI command bar or menu-bar assistant.

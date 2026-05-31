@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 from speedwagon_ai.config import Settings
@@ -70,6 +71,9 @@ class StorageOutputTests(unittest.TestCase):
         self.assertIn("- [[commitments]]", markdown)
         self.assertEqual(len(bundle["action_items"]), 1)
         self.assertEqual(len(self.repo.unresolved_work()), 2)
+        tasks = self.repo.list_tasks(status="open")
+        self.assertEqual(len(tasks), 2)
+        self.assertTrue(any(task["source"] == "action_item" for task in tasks))
 
     def test_commitments_markdown_handles_missing_owner_deadline(self) -> None:
         meeting = self.repo.create_meeting("Roadmap")
@@ -80,6 +84,28 @@ class StorageOutputTests(unittest.TestCase):
         markdown = render_commitments_markdown(self.repo.unresolved_work())
         self.assertIn("## Unassigned", markdown)
         self.assertIn("[commitment] Confirm scope", markdown)
+
+    def test_task_lifecycle_and_overdue_logic(self) -> None:
+        task = self.repo.create_task("Follow up on launch", owner="Anish", due_date="2026-05-29")
+        self.assertEqual(task["status"], "open")
+        overdue = self.repo.overdue_tasks(today=date(2026, 5, 31))
+        self.assertEqual(overdue[0]["id"], task["id"])
+        self.assertIn("2 days ago", overdue[0]["reminder_suggestion"])
+
+        done = self.repo.complete_task(task["id"])
+        self.assertEqual(done["status"], "done")
+        self.assertIsNotNone(done["completed_at"])
+        self.assertEqual(self.repo.overdue_tasks(today=date(2026, 5, 31)), [])
+
+        reopened = self.repo.reopen_task(task["id"])
+        self.assertEqual(reopened["status"], "open")
+        self.assertIsNone(reopened["completed_at"])
+
+    def test_commitments_markdown_uses_unified_tasks(self) -> None:
+        self.repo.create_task("Manual reminder", owner="Anish", due_date="2026-06-01")
+        markdown = render_commitments_markdown(self.repo.list_tasks(status="open"))
+        self.assertIn("[manual] Manual reminder due 2026-06-01", markdown)
+        self.assertIn("[[Manual task]]", markdown)
 
     def test_writer_creates_files(self) -> None:
         meeting = self.repo.create_meeting("Demo")

@@ -55,6 +55,15 @@ class CliFlowTests(unittest.TestCase):
                     notes = list((root / "notes").glob("*.md"))
                     self.assertTrue(any(path.name == "commitments.md" for path in notes))
                     self.assertTrue(any("fixture-meeting" in path.name for path in notes))
+
+                    self.assertEqual(main(["tasks", "add", "Manual CLI task", "--due", "2026-06-01"]), 0)
+                    cli_task = next(task for task in repo.list_tasks(status="open") if task["text"] == "Manual CLI task")
+                    self.assertEqual(main(["tasks", "complete", str(cli_task["id"])]), 0)
+                    self.assertEqual(repo.get_task(cli_task["id"])["status"], "done")
+                    self.assertEqual(main(["ask", "add task ask cli task due 2026-06-02"]), 0)
+                    ask_task = next(task for task in repo.list_tasks(status="open") if task["text"] == "ask cli task")
+                    self.assertEqual(main(["ask", f"complete task {ask_task['id']}"]), 0)
+                    self.assertEqual(repo.get_task(ask_task["id"])["status"], "done")
                 finally:
                     os.chdir(old_cwd)
 

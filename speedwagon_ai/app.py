@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from speedwagon_ai.assistant_actions import run_action
+from speedwagon_ai.assistant_commands import execute_command
 from speedwagon_ai.capture import Recorder, recorder_command
 from speedwagon_ai.config import Settings
 from speedwagon_ai.context import render_context
@@ -54,6 +56,12 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json({"topic": topic, "markdown": render_context(repo, topic)})
                 elif parsed.path == "/api/commitments":
                     self._send_json({"items": repo.unresolved_work()})
+                elif parsed.path == "/api/tasks":
+                    status = parse_qs(parsed.query).get("status", ["open"])[0] or None
+                    include_done = parse_qs(parsed.query).get("include_done", ["false"])[0].lower() == "true"
+                    self._send_json({"tasks": repo.list_tasks(status=status, include_done=include_done)})
+                elif parsed.path == "/api/tasks/overdue":
+                    self._send_json({"tasks": repo.overdue_tasks()})
                 elif parsed.path == "/api/settings":
                     self._send_json(settings_payload(settings))
                 elif parsed.path == "/api/record/state":
@@ -79,6 +87,33 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     repo.init()
                     meeting_id = Recorder(settings, repo).stop()
                     self._send_json({"meeting_id": meeting_id})
+                elif parsed.path == "/api/tasks":
+                    task = repo.create_task(
+                        str(payload.get("text") or ""),
+                        owner=_optional(payload.get("owner")),
+                        due_date=_optional(payload.get("due_date")),
+                    )
+                    MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json({"task": task})
+                elif parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/complete"):
+                    task_id = _task_id_from_path(parsed.path)
+                    task = run_action(settings, repo, "complete_task", {"task_id": task_id})["task"]
+                    MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json({"task": task})
+                elif parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/reopen"):
+                    task_id = _task_id_from_path(parsed.path)
+                    task = repo.reopen_task(task_id)
+                    MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json({"task": task})
+                elif parsed.path == "/api/actions":
+                    action = str(payload.get("action") or "")
+                    self._send_json(run_action(settings, repo, action, payload.get("payload") or {}))
+                elif parsed.path == "/api/assistant/command":
+                    command = str(payload.get("command") or "")
+                    response = execute_command(settings, repo, command)
+                    if response.get("action") in {"add_task", "complete_task", "reopen_task"}:
+                        MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json(response)
                 elif parsed.path.startswith("/api/meetings/") and parsed.path.endswith("/process"):
                     meeting_id = _meeting_id_from_path(parsed.path)
                     repo.init()
@@ -166,6 +201,14 @@ def _meeting_id_from_path(path: str) -> int:
         return int(parts[2])
     except (IndexError, ValueError) as exc:
         raise ValueError("Invalid meeting id") from exc
+
+
+def _task_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[2])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid task id") from exc
 
 
 def _optional(value: Any) -> str | None:
@@ -264,6 +307,7 @@ APP_HTML = """<!doctype html>
         <button class="nav active" data-view="dashboard">Dashboard</button>
         <button class="nav" data-view="record">Recorder</button>
         <button class="nav" data-view="meetings">Meetings</button>
+        <button class="nav" data-view="tasks">Tasks</button>
         <button class="nav" data-view="commitments">Commitments</button>
         <button class="nav" data-view="settings">Settings</button>
       </nav>
@@ -280,9 +324,19 @@ APP_HTML = """<!doctype html>
       <section id="dashboard" class="view active">
         <div class="grid two">
           <section class="panel">
+            <h2>Assistant</h2>
+            <div class="row">
+              <input id="assistant-command" placeholder="Ask: what is overdue, complete task 12, search context for onboarding">
+              <button id="assistant-run">Run</button>
+            </div>
+            <pre id="assistant-output"></pre>
+          </section>
+          <section class="panel">
             <h2>Recent Meetings</h2>
             <div id="recent-meetings" class="list"></div>
           </section>
+        </div>
+        <div class="grid single">
           <section class="panel">
             <h2>Context Search</h2>
             <div class="row">
@@ -332,6 +386,27 @@ APP_HTML = """<!doctype html>
             </div>
           </section>
         </div>
+      </section>
+
+      <section id="tasks" class="view">
+        <div class="grid two">
+          <section class="panel">
+            <h2>Task Inbox</h2>
+            <div class="stack task-add">
+              <input id="task-text" placeholder="Add a task">
+              <div class="row">
+                <input id="task-owner" placeholder="Owner">
+                <input id="task-due" placeholder="Due YYYY-MM-DD">
+                <button id="task-add">Add</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel">
+            <h2>Reminder Suggestions</h2>
+            <div id="task-suggestions" class="list"></div>
+          </section>
+        </div>
+        <div id="task-groups" class="task-groups"></div>
       </section>
 
       <section id="commitments" class="view">
@@ -421,6 +496,7 @@ h3 { font-size: 14px; margin: 20px 0 10px; }
 .view.active { display: block; }
 .grid { display: grid; gap: 16px; }
 .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.single { grid-template-columns: minmax(0, 1fr); margin-top: 16px; }
 .meetings-layout { grid-template-columns: 320px minmax(0, 1fr); align-items: start; }
 .panel {
   background: var(--panel);
@@ -462,19 +538,36 @@ pre {
 }
 .kv { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 8px 14px; }
 .kv div:nth-child(odd) { color: var(--muted); }
+.task-add { margin-bottom: 4px; }
+.task-groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+.task-group h2 { margin-bottom: 10px; }
+.task-actions { display: flex; gap: 8px; margin-top: 8px; }
+.badge {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 12px;
+  color: var(--muted);
+}
 @media (max-width: 860px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
-  nav { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .nav { text-align: center; }
-  .two, .meetings-layout { grid-template-columns: 1fr; }
+  .two, .meetings-layout, .task-groups { grid-template-columns: 1fr; }
   header { align-items: flex-start; }
 }
 """
 
 
 APP_JS = """
-const state = { meetings: [], selectedMeetingId: null };
+const state = { meetings: [], tasks: [], selectedMeetingId: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -500,15 +593,18 @@ function showView(name) {
 
 async function refresh() {
   try {
-    const [meetings, commitments, settings, recordState] = await Promise.all([
+    const [meetings, commitments, tasks, settings, recordState] = await Promise.all([
       api("/api/meetings"),
       api("/api/commitments"),
+      api("/api/tasks?status=&include_done=true"),
       api("/api/settings"),
       api("/api/record/state"),
     ]);
     state.meetings = meetings.meetings;
+    state.tasks = tasks.tasks;
     renderMeetings();
     renderCommitments(commitments.items);
+    renderTasks(tasks.tasks);
     renderSettings(settings);
     $("record-state").textContent = JSON.stringify(recordState, null, 2);
     setStatus("Ready");
@@ -557,6 +653,77 @@ function renderCommitments(items) {
     `;
     target.appendChild(node);
   });
+}
+
+function renderTasks(tasks) {
+  const groups = groupTasks(tasks);
+  const target = $("task-groups");
+  target.innerHTML = "";
+  ["Overdue", "Today", "Upcoming", "Unscheduled", "Done"].forEach((name) => {
+    const panel = document.createElement("section");
+    panel.className = "panel task-group";
+    panel.innerHTML = `<h2>${name}</h2><div class="list"></div>`;
+    const listNode = panel.querySelector(".list");
+    const items = groups[name] || [];
+    if (!items.length) {
+      listNode.innerHTML = '<div class="meta">Nothing here.</div>';
+    } else {
+      items.forEach((task) => listNode.appendChild(taskNode(task)));
+    }
+    target.appendChild(panel);
+  });
+  renderTaskSuggestions(tasks);
+}
+
+function groupTasks(tasks) {
+  const today = new Date().toISOString().slice(0, 10);
+  const groups = { Overdue: [], Today: [], Upcoming: [], Unscheduled: [], Done: [] };
+  tasks.forEach((task) => {
+    if (task.status === "done") groups.Done.push(task);
+    else if (!task.due_date) groups.Unscheduled.push(task);
+    else if (task.due_date < today) groups.Overdue.push(task);
+    else if (task.due_date === today) groups.Today.push(task);
+    else groups.Upcoming.push(task);
+  });
+  return groups;
+}
+
+function taskNode(task) {
+  const node = document.createElement("div");
+  node.className = "item";
+  const meetingMeta = task.meeting_title ? ` · ${escapeHtml(task.meeting_title)}` : "";
+  const due = task.due_date ? ` · due ${escapeHtml(task.due_date)}` : "";
+  const suggestion = task.reminder_suggestion ? `<div class="meta">${escapeHtml(task.reminder_suggestion)}</div>` : "";
+  node.innerHTML = `
+    <strong>${escapeHtml(task.text)}</strong>
+    <div class="meta">${escapeHtml(task.owner || "unassigned")}${due}${meetingMeta}</div>
+    ${suggestion}
+    <span class="badge">${escapeHtml(task.source)}</span>
+    <div class="task-actions">
+      ${task.status === "done"
+        ? `<button data-action="reopen">Reopen</button>`
+        : `<button data-action="complete">Complete</button>`}
+      ${task.meeting_id ? `<button data-action="meeting">Open Meeting</button>` : ""}
+    </div>
+  `;
+  const complete = node.querySelector('[data-action="complete"]');
+  const reopen = node.querySelector('[data-action="reopen"]');
+  const meetingButton = node.querySelector('[data-action="meeting"]');
+  if (complete) complete.onclick = () => completeTask(task.id);
+  if (reopen) reopen.onclick = () => reopenTask(task.id);
+  if (meetingButton) meetingButton.onclick = () => loadMeeting(task.meeting_id);
+  return node;
+}
+
+function renderTaskSuggestions(tasks) {
+  const target = $("task-suggestions");
+  const suggested = tasks.filter((task) => task.status !== "done" && task.reminder_suggestion);
+  target.innerHTML = "";
+  if (!suggested.length) {
+    target.innerHTML = '<div class="meta">No reminder suggestions right now.</div>';
+    return;
+  }
+  suggested.slice(0, 6).forEach((task) => target.appendChild(taskNode(task)));
 }
 
 function renderSettings(settings) {
@@ -631,6 +798,71 @@ async function processMeeting() {
   await refresh();
 }
 
+async function runAssistantCommand() {
+  const command = $("assistant-command").value.trim();
+  if (!command) return setStatus("Assistant command is required");
+  const data = await api("/api/assistant/command", {
+    method: "POST",
+    body: JSON.stringify({ command }),
+  });
+  $("assistant-output").textContent = renderAssistantResult(data);
+  setStatus(data.summary);
+  if (["add_task", "complete_task", "reopen_task"].includes(data.action)) {
+    refresh();
+  }
+}
+
+function renderAssistantResult(data) {
+  const lines = [data.summary];
+  if (!data.supported) return lines.join("\\n");
+  const result = data.result || {};
+  if (result.tasks) {
+    if (!result.tasks.length) return lines.join("\\n");
+    lines.push("");
+    result.tasks.forEach((task) => {
+      const due = task.due_date ? ` due ${task.due_date}` : "";
+      lines.push(`[${task.id}] ${task.text}${due}`);
+    });
+  } else if (result.task) {
+    const task = result.task;
+    const due = task.due_date ? ` due ${task.due_date}` : "";
+    lines.push("", `[${task.id}] ${task.text}${due} (${task.status})`);
+  } else if (result.markdown) {
+    lines.push("", result.markdown);
+  }
+  return lines.join("\\n");
+}
+
+async function addTask() {
+  const text = $("task-text").value.trim();
+  if (!text) return setStatus("Task text is required");
+  await api("/api/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      text,
+      owner: $("task-owner").value,
+      due_date: $("task-due").value,
+    }),
+  });
+  $("task-text").value = "";
+  $("task-owner").value = "";
+  $("task-due").value = "";
+  setStatus("Task added");
+  refresh();
+}
+
+async function completeTask(id) {
+  await api(`/api/tasks/${id}/complete`, { method: "POST", body: "{}" });
+  setStatus(`Completed task ${id}`);
+  refresh();
+}
+
+async function reopenTask(id) {
+  await api(`/api/tasks/${id}/reopen`, { method: "POST", body: "{}" });
+  setStatus(`Reopened task ${id}`);
+  refresh();
+}
+
 async function previewEmail() {
   if (!state.selectedMeetingId) return setStatus("Select a meeting first");
   const payload = emailPayload();
@@ -683,6 +915,11 @@ document.querySelectorAll(".nav").forEach((button) => button.onclick = () => sho
 $("refresh").onclick = refresh;
 $("record-start").onclick = () => startRecording().catch((error) => setStatus(error.message));
 $("record-stop").onclick = () => stopRecording().catch((error) => setStatus(error.message));
+$("assistant-run").onclick = () => runAssistantCommand().catch((error) => setStatus(error.message));
+$("assistant-command").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") runAssistantCommand().catch((error) => setStatus(error.message));
+});
+$("task-add").onclick = () => addTask().catch((error) => setStatus(error.message));
 $("process-meeting").onclick = () => processMeeting().catch((error) => setStatus(error.message));
 $("email-preview").onclick = () => previewEmail().catch((error) => setStatus(error.message));
 $("email-create").onclick = () => createEmailDraft().catch((error) => setStatus(error.message));

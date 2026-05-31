@@ -28,7 +28,7 @@ class MarkdownWriter:
     def write_commitments(self) -> Path:
         self.settings.notes_dir.mkdir(parents=True, exist_ok=True)
         path = self.settings.notes_dir / "commitments.md"
-        path.write_text(render_commitments_markdown(self.repo.unresolved_work()), encoding="utf-8")
+        path.write_text(render_commitments_markdown(self.repo.list_tasks(status="open")), encoding="utf-8")
         return path
 
 
@@ -109,15 +109,18 @@ def render_commitments_markdown(rows: list[dict[str, Any]]) -> str:
         "",
     ]
     if not rows:
-        lines.extend(["_No unresolved commitments or action items._", ""])
+        lines.extend(["_No unresolved tasks._", ""])
         return "\n".join(lines)
     for owner in sorted(grouped):
         lines.extend([f"## {owner}", ""])
         for row in grouped[owner]:
             due = f" due {row['deadline']}" if row.get("deadline") else ""
+            meeting = row.get("meeting_title") or "Manual task"
+            meeting_id = f"; meeting {row['meeting_id']}" if row.get("meeting_id") else ""
+            suggestion = f" — {row['reminder_suggestion']}" if row.get("reminder_suggestion") else ""
             lines.append(
                 f"- [{row['kind']}] {row['text']}{due} "
-                f"([[{row['meeting_title']}]]; meeting {row['meeting_id']})"
+                f"([[{meeting}]]{meeting_id}){suggestion}"
             )
         lines.append("")
     return "\n".join(lines)

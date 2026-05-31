@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,23 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     body TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    owner TEXT,
+    due_date TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    source TEXT NOT NULL DEFAULT 'manual',
+    source_table TEXT,
+    source_id INTEGER,
+    source_meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    reminder_suggestion TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -108,6 +126,8 @@ class Repository:
             conn.executescript(SCHEMA)
             self._ensure_column(conn, "email_drafts", "tone", "TEXT")
             self._ensure_column(conn, "email_drafts", "included_items_json", "TEXT")
+            self._ensure_column(conn, "tasks", "reminder_suggestion", "TEXT")
+            self.sync_tasks_from_existing_work(conn)
 
     def create_meeting(self, title: str, audio_path: str | None = None) -> Meeting:
         now = utc_now_iso()
@@ -164,8 +184,21 @@ class Repository:
                 """,
                 (result.summary, json.dumps(result.raw, indent=2, sort_keys=True), now, meeting_id),
             )
-            self._insert_items(conn, "action_items", meeting_id, result.action_items, now)
-            self._insert_items(conn, "commitments", meeting_id, result.commitments, now)
+            conn.execute(
+                """
+                DELETE FROM tasks
+                WHERE source_meeting_id = ?
+                  AND source IN ('action_item', 'commitment')
+                  AND status != 'done'
+                """,
+                (meeting_id,),
+            )
+            action_ids = self._insert_items(conn, "action_items", meeting_id, result.action_items, now)
+            commitment_ids = self._insert_items(conn, "commitments", meeting_id, result.commitments, now)
+            for item, source_id in zip(result.action_items, action_ids):
+                self._insert_task_from_item(conn, meeting_id, "action_item", "action_items", source_id, item, now)
+            for item, source_id in zip(result.commitments, commitment_ids):
+                self._insert_task_from_item(conn, meeting_id, "commitment", "commitments", source_id, item, now)
             self._insert_text_rows(conn, "decisions", "text", meeting_id, result.decisions, now)
             self._insert_text_rows(conn, "open_questions", "text", meeting_id, result.open_questions, now)
             self._insert_text_rows(conn, "key_topics", "topic", meeting_id, result.key_topics, now)
@@ -185,36 +218,135 @@ class Repository:
             }
 
     def unresolved_work(self) -> list[dict[str, Any]]:
-        query = """
-        SELECT *
-        FROM (
-            SELECT
-                'action_item' AS kind,
-                action_items.*,
-                meetings.title AS meeting_title,
-                meetings.started_at,
-                owner IS NULL AS owner_missing,
-                deadline IS NULL AS deadline_missing
-            FROM action_items
-            JOIN meetings ON meetings.id = action_items.meeting_id
-            WHERE action_items.status != 'done'
-            UNION ALL
-            SELECT
-                'commitment' AS kind,
-                commitments.*,
-                meetings.title AS meeting_title,
-                meetings.started_at,
-                owner IS NULL AS owner_missing,
-                deadline IS NULL AS deadline_missing
-            FROM commitments
-            JOIN meetings ON meetings.id = commitments.meeting_id
-            WHERE commitments.status != 'done'
-        )
-        ORDER BY owner_missing, owner, deadline_missing, deadline, started_at DESC
+        return self.list_tasks(status="open")
+
+    def list_tasks(self, status: str | None = "open", include_done: bool = False) -> list[dict[str, Any]]:
+        conditions = []
+        params: list[Any] = []
+        if status:
+            conditions.append("tasks.status = ?")
+            params.append(status)
+        elif not include_done:
+            conditions.append("tasks.status != 'done'")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+        SELECT
+            tasks.*,
+            tasks.source AS kind,
+            tasks.due_date AS deadline,
+            tasks.source_meeting_id AS meeting_id,
+            meetings.title AS meeting_title,
+            meetings.started_at,
+            tasks.owner IS NULL AS owner_missing,
+            tasks.due_date IS NULL AS deadline_missing
+        FROM tasks
+        LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+        {where}
+        ORDER BY
+            tasks.status = 'done',
+            deadline_missing,
+            tasks.due_date,
+            owner_missing,
+            tasks.owner,
+            tasks.created_at DESC
         """
         with self.connect() as conn:
-            rows = conn.execute(query).fetchall()
-        return [dict(row) for row in rows]
+            rows = conn.execute(query, params).fetchall()
+        return [self._task_dict(row) for row in rows]
+
+    def overdue_tasks(self, today: date | None = None) -> list[dict[str, Any]]:
+        today_iso = (today or date.today()).isoformat()
+        query = """
+        SELECT
+            tasks.*,
+            tasks.source AS kind,
+            tasks.due_date AS deadline,
+            tasks.source_meeting_id AS meeting_id,
+            meetings.title AS meeting_title,
+            meetings.started_at
+        FROM tasks
+        LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+        WHERE tasks.status != 'done'
+          AND tasks.due_date IS NOT NULL
+          AND tasks.due_date < ?
+        ORDER BY tasks.due_date, tasks.created_at DESC
+        """
+        with self.connect() as conn:
+            rows = conn.execute(query, (today_iso,)).fetchall()
+        return [self._task_dict(row, today=today or date.today()) for row in rows]
+
+    def create_task(
+        self,
+        text: str,
+        owner: str | None = None,
+        due_date: str | None = None,
+        source: str = "manual",
+        source_meeting_id: int | None = None,
+        confidence: float = 1.0,
+    ) -> dict[str, Any]:
+        if not text.strip():
+            raise ValueError("Task text is required")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO tasks (
+                    text, owner, due_date, status, source, source_meeting_id,
+                    confidence, reminder_suggestion, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    text.strip(),
+                    _optional(owner),
+                    _optional(due_date),
+                    source,
+                    source_meeting_id,
+                    confidence,
+                    reminder_suggestion(_optional(due_date)),
+                    now,
+                    now,
+                ),
+            )
+            task_id = int(cur.lastrowid)
+        return self.get_task(task_id)
+
+    def get_task(self, task_id: int) -> dict[str, Any]:
+        query = """
+        SELECT
+            tasks.*,
+            tasks.source AS kind,
+            tasks.due_date AS deadline,
+            tasks.source_meeting_id AS meeting_id,
+            meetings.title AS meeting_title,
+            meetings.started_at
+        FROM tasks
+        LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+        WHERE tasks.id = ?
+        """
+        with self.connect() as conn:
+            row = conn.execute(query, (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Task {task_id} not found")
+        return self._task_dict(row)
+
+    def complete_task(self, task_id: int) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, task_id),
+            )
+        return self.get_task(task_id)
+
+    def reopen_task(self, task_id: int) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ? WHERE id = ?",
+                (now, task_id),
+            )
+        return self.get_task(task_id)
 
     def context_for_topic(self, topic: str, limit: int = 8) -> dict[str, Any]:
         needle = f"%{topic.lower()}%"
@@ -300,6 +432,51 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def sync_tasks_from_existing_work(self, conn: sqlite3.Connection | None = None) -> None:
+        owns_connection = conn is None
+        active_conn = conn or self.connect()
+        now = utc_now_iso()
+        try:
+            for source, table in [("action_item", "action_items"), ("commitment", "commitments")]:
+                rows = active_conn.execute(
+                    f"""
+                    SELECT * FROM {table}
+                    WHERE status != 'done'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tasks
+                        WHERE tasks.source_table = ?
+                          AND tasks.source_id = {table}.id
+                      )
+                    """,
+                    (table,),
+                ).fetchall()
+                for row in rows:
+                    active_conn.execute(
+                        """
+                        INSERT INTO tasks (
+                            text, owner, due_date, status, source, source_table, source_id,
+                            source_meeting_id, confidence, reminder_suggestion, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.85, ?, ?, ?)
+                        """,
+                        (
+                            row["text"],
+                            row["owner"],
+                            row["deadline"],
+                            row["status"],
+                            source,
+                            table,
+                            row["id"],
+                            row["meeting_id"],
+                            reminder_suggestion(row["deadline"]),
+                            now,
+                            now,
+                        ),
+                    )
+        finally:
+            if owns_connection:
+                active_conn.close()
+
     @staticmethod
     def _meeting_from_row(row: sqlite3.Row) -> Meeting:
         return Meeting(
@@ -314,15 +491,53 @@ class Repository:
         )
 
     @staticmethod
-    def _insert_items(conn: sqlite3.Connection, table: str, meeting_id: int, items: list[ExtractedItem], now: str) -> None:
+    def _insert_items(conn: sqlite3.Connection, table: str, meeting_id: int, items: list[ExtractedItem], now: str) -> list[int]:
+        ids = []
         for item in items:
-            conn.execute(
+            cur = conn.execute(
                 f"""
                 INSERT INTO {table} (meeting_id, text, owner, deadline, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (meeting_id, item.text, item.owner, item.deadline, item.status, now, now),
             )
+            ids.append(int(cur.lastrowid))
+        return ids
+
+    @staticmethod
+    def _insert_task_from_item(
+        conn: sqlite3.Connection,
+        meeting_id: int,
+        source: str,
+        source_table: str,
+        source_id: int,
+        item: ExtractedItem,
+        now: str,
+    ) -> None:
+        if item.status == "done":
+            return
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                text, owner, due_date, status, source, source_table, source_id,
+                source_meeting_id, confidence, reminder_suggestion, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.9, ?, ?, ?)
+            """,
+            (
+                item.text,
+                item.owner,
+                item.deadline,
+                item.status,
+                source,
+                source_table,
+                source_id,
+                meeting_id,
+                reminder_suggestion(item.deadline),
+                now,
+                now,
+            ),
+        )
 
     @staticmethod
     def _insert_text_rows(
@@ -349,3 +564,40 @@ class Repository:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _task_dict(row: sqlite3.Row, today: date | None = None) -> dict[str, Any]:
+        item = dict(row)
+        due = item.get("due_date")
+        current = today or date.today()
+        item["deadline"] = due
+        item["kind"] = item.get("source")
+        item["meeting_id"] = item.get("source_meeting_id")
+        item["is_overdue"] = bool(item.get("status") != "done" and due and due < current.isoformat())
+        if item.get("status") != "done":
+            item["reminder_suggestion"] = reminder_suggestion(due, today=current)
+        return item
+
+
+def _optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def reminder_suggestion(due_date: str | None, today: date | None = None) -> str | None:
+    if not due_date:
+        return None
+    current = today or date.today()
+    try:
+        due = date.fromisoformat(due_date)
+    except ValueError:
+        return None
+    delta = (current - due).days
+    if delta > 0:
+        unit = "day" if delta == 1 else "days"
+        return f"This was due {delta} {unit} ago. Confirm complete or follow up."
+    if delta == 0:
+        return "This is due today. Confirm status or follow up."
+    return None
