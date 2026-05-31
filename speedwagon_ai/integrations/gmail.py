@@ -4,23 +4,18 @@ import base64
 from email.message import EmailMessage
 
 from speedwagon_ai.config import Settings
+from speedwagon_ai.email_composer import EmailComposer, EmailDraftContent
 from speedwagon_ai.storage import Repository
 
 
-def build_followup_email(
-    repo: Repository,
-    meeting_id: int,
+def build_email_message(
+    draft: EmailDraftContent,
     to: str = "",
-    subject: str | None = None,
-    instruction: str = "",
 ) -> EmailMessage:
-    bundle = repo.meeting_bundle(meeting_id)
-    meeting = bundle["meeting"]
     message = EmailMessage()
     message["To"] = to
-    message["Subject"] = subject or f"Follow-up: {meeting.title}"
-    body = render_followup_body(bundle, instruction=instruction)
-    message.set_content(body)
+    message["Subject"] = draft.subject
+    message.set_content(draft.body)
     return message
 
 
@@ -31,6 +26,7 @@ def create_gmail_draft(
     to: str = "",
     subject: str | None = None,
     instruction: str = "",
+    body: str | None = None,
 ) -> str:
     try:
         from google.auth.transport.requests import Request
@@ -58,7 +54,23 @@ def create_gmail_draft(
         settings.gmail_token_path.parent.mkdir(parents=True, exist_ok=True)
         settings.gmail_token_path.write_text(creds.to_json(), encoding="utf-8")
 
-    message = build_followup_email(repo, meeting_id, to=to, subject=subject, instruction=instruction)
+    if body is None:
+        draft_content = EmailComposer(settings, repo).compose(
+            meeting_id,
+            to=to,
+            subject=subject,
+            instruction=instruction,
+        )
+    else:
+        fallback_subject = subject or f"Follow-up: {repo.get_meeting(meeting_id).title}"
+        draft_content = EmailDraftContent(
+            subject=fallback_subject,
+            body=body,
+            tone="edited",
+            included_items=[],
+            provider="edited",
+        )
+    message = build_email_message(draft_content, to=to)
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     service = build("gmail", "v1", credentials=creds)
     draft = service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
@@ -71,61 +83,22 @@ def create_gmail_draft(
         subject=str(message["Subject"]),
         instruction=instruction or None,
         body=message.get_content(),
+        tone=draft_content.tone,
+        included_items=draft_content.included_items,
     )
     return draft_id
 
 
-def render_followup_body(bundle: dict, instruction: str = "") -> str:
-    meeting = bundle["meeting"]
-    lines = [
-        "Hi,",
-        "",
-    ]
-    if instruction.strip():
-        lines.extend(
-            [
-                f"Following up on {meeting.title}.",
-                "",
-                f"Focus for this draft: {instruction.strip()}",
-                "",
-            ]
-        )
-    else:
-        lines.extend([f"Quick follow-up from {meeting.title}:", ""])
-    lines.extend(
-        [
-            "Summary:",
-            meeting.summary or "No summary captured.",
-            "",
-            "Decisions:",
-        ]
-    )
-    lines.extend([f"- {row['text']}" for row in bundle["decisions"]] or ["- None captured"])
-    lines.extend(["", "Action items:"])
-    if bundle["action_items"]:
-        for row in bundle["action_items"]:
-            owner = row.get("owner") or "unassigned"
-            deadline = f" due {row['deadline']}" if row.get("deadline") else ""
-            lines.append(f"- {row['text']} ({owner}{deadline})")
-    else:
-        lines.append("- None captured")
-    lines.extend(["", "Open questions:"])
-    lines.extend([f"- {row['text']}" for row in bundle["open_questions"]] or ["- None captured"])
-    lines.extend(["", "Thanks,"])
-    return "\n".join(lines)
-
-
 def preview_followup_email(
+    settings: Settings,
     repo: Repository,
     meeting_id: int,
     to: str = "",
     subject: str | None = None,
     instruction: str = "",
-) -> dict[str, str]:
-    bundle = repo.meeting_bundle(meeting_id)
-    meeting = bundle["meeting"]
+) -> dict:
+    draft = EmailComposer(settings, repo).compose(meeting_id, to=to, subject=subject, instruction=instruction)
     return {
         "to": to,
-        "subject": subject or f"Follow-up: {meeting.title}",
-        "body": render_followup_body(bundle, instruction=instruction),
+        **draft.to_dict(),
     }

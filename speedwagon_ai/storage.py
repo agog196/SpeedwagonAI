@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     recipient TEXT,
     subject TEXT NOT NULL,
     instruction TEXT,
+    tone TEXT,
+    included_items_json TEXT,
     body TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -104,6 +106,8 @@ class Repository:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_column(conn, "email_drafts", "tone", "TEXT")
+            self._ensure_column(conn, "email_drafts", "included_items_json", "TEXT")
 
     def create_meeting(self, title: str, audio_path: str | None = None) -> Meeting:
         now = utc_now_iso()
@@ -256,17 +260,31 @@ class Repository:
         subject: str,
         instruction: str | None,
         body: str,
+        tone: str | None = None,
+        included_items: list[str] | None = None,
     ) -> int:
         now = utc_now_iso()
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO email_drafts (
-                    meeting_id, provider, provider_draft_id, recipient, subject, instruction, body, created_at
+                    meeting_id, provider, provider_draft_id, recipient, subject,
+                    instruction, tone, included_items_json, body, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (meeting_id, provider, provider_draft_id, recipient, subject, instruction, body, now),
+                (
+                    meeting_id,
+                    provider,
+                    provider_draft_id,
+                    recipient,
+                    subject,
+                    instruction,
+                    tone,
+                    json.dumps(included_items or []),
+                    body,
+                    now,
+                ),
             )
             return int(cur.lastrowid)
 
@@ -325,3 +343,9 @@ class Repository:
     def _rows(conn: sqlite3.Connection, table: str, meeting_id: int) -> list[dict[str, Any]]:
         rows = conn.execute(f"SELECT * FROM {table} WHERE meeting_id = ? ORDER BY id", (meeting_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

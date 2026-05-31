@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 
 from speedwagon_ai.config import Settings
+from speedwagon_ai.email_composer import fallback_compose, parse_email_content
 from speedwagon_ai.extraction import parse_extraction
-from speedwagon_ai.integrations.gmail import preview_followup_email, render_followup_body
+from speedwagon_ai.integrations.gmail import preview_followup_email
 from speedwagon_ai.models import ExtractionResult, ExtractedItem
 from speedwagon_ai.output import MarkdownWriter, render_commitments_markdown, render_meeting_markdown
 from speedwagon_ai.storage import Repository
@@ -101,14 +102,16 @@ class StorageOutputTests(unittest.TestCase):
             ),
         )
         preview = preview_followup_email(
+            self.settings,
             self.repo,
             meeting.id,
             to="person@example.com",
             instruction="Make it warm and focus on next steps.",
         )
         self.assertEqual(preview["to"], "person@example.com")
-        self.assertIn("Focus for this draft: Make it warm", preview["body"])
+        self.assertNotIn("Make it warm and focus on next steps.", preview["body"])
         self.assertIn("Send launch notes", preview["body"])
+        self.assertEqual(preview["provider"], "fallback")
 
         draft_id = self.repo.save_email_draft(
             meeting_id=meeting.id,
@@ -118,10 +121,47 @@ class StorageOutputTests(unittest.TestCase):
             subject=preview["subject"],
             instruction="Make it warm and focus on next steps.",
             body=preview["body"],
+            tone=preview["tone"],
+            included_items=preview["included_items"],
         )
         drafts = self.repo.email_drafts_for_meeting(meeting.id)
         self.assertEqual(drafts[0]["id"], draft_id)
         self.assertEqual(drafts[0]["provider_draft_id"], "draft-123")
+        self.assertEqual(drafts[0]["tone"], "warm")
+
+    def test_fallback_email_instruction_is_private(self) -> None:
+        meeting = self.repo.create_meeting("Design Review")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Reviewed dashboard and email draft flows.",
+                action_items=[ExtractedItem("Send revised draft", owner="Anish")],
+                decisions=["Keep Gmail draft-only"],
+                open_questions=["Should reminders be next?"],
+                raw={"summary": "Reviewed dashboard and email draft flows."},
+            ),
+        )
+        bundle = self.repo.meeting_bundle(meeting.id)
+        instruction = "Make it concise and focus on the decision."
+        draft = fallback_compose(bundle, instruction=instruction)
+        self.assertNotIn(instruction, draft.body)
+        self.assertEqual(draft.tone, "concise")
+        self.assertIn("Keep Gmail draft-only", draft.body)
+
+    def test_parse_email_content_from_llm_fixture(self) -> None:
+        draft = parse_email_content(
+            {
+                "subject": "Next steps from design review",
+                "body": "Hi,\n\nThanks for the discussion. I will send the revised draft today.\n\nBest,",
+                "tone": "warm",
+                "included_items": ["summary", "action_items"],
+            },
+            fallback_subject="Follow-up",
+            provider="openai",
+        )
+        self.assertEqual(draft.subject, "Next steps from design review")
+        self.assertEqual(draft.tone, "warm")
+        self.assertEqual(draft.included_items, ["summary", "action_items"])
 
 
 class ExtractionParsingTests(unittest.TestCase):

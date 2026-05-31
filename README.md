@@ -43,7 +43,15 @@ The app runs at `http://127.0.0.1:8765` by default and uses the same local SQLit
 
 ## Gmail Draft Instructions
 
-Create a draft with an instruction:
+Preview a draft with an instruction:
+
+```bash
+speedwagon gmail preview <meeting-id> \
+  --to person@example.com \
+  --instruction "Write a warm follow-up thanking them and listing next steps."
+```
+
+Create the Gmail draft:
 
 ```bash
 speedwagon gmail draft <meeting-id> \
@@ -55,7 +63,9 @@ Gmail remains draft-only; SpeedwagonAI does not send mail automatically.
 
 ## Meeting Audio With Headphones
 
-The default capture mode records your microphone. To capture meeting/system audio while using headphones, install and configure a virtual audio device such as BlackHole, then set:
+The default capture mode records your microphone. It does not capture meeting audio playing only through headphones.
+
+To capture routed meeting/system audio today, install and configure a virtual audio device such as BlackHole, then set:
 
 ```env
 SPEEDWAGON_CAPTURE_PROFILE=blackhole
@@ -67,3 +77,5 @@ For most local testing, keep:
 ```env
 SPEEDWAGON_CAPTURE_PROFILE=mic
 ```
+
+Long term, the native Mac app direction should explore Apple's ScreenCaptureKit for a cleaner built-in capture path. See [Native Mac Roadmap](docs/native-mac-roadmap.md).

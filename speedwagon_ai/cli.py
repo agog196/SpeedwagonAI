@@ -9,7 +9,7 @@ from speedwagon_ai.app import run_app
 from speedwagon_ai.config import Settings
 from speedwagon_ai.context import render_context
 from speedwagon_ai.extraction import Extractor
-from speedwagon_ai.integrations.gmail import create_gmail_draft
+from speedwagon_ai.integrations.gmail import create_gmail_draft, preview_followup_email
 from speedwagon_ai.output import MarkdownWriter
 from speedwagon_ai.storage import Repository
 from speedwagon_ai.transcription import Transcriber
@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     gmail_parser = subparsers.add_parser("gmail", help="Gmail integrations.")
     gmail_sub = gmail_parser.add_subparsers(dest="gmail_command", required=True)
+    preview_parser = gmail_sub.add_parser("preview", help="Preview a follow-up email without creating a Gmail draft.")
+    preview_parser.add_argument("meeting_id", type=int)
+    preview_parser.add_argument("--to", default="")
+    preview_parser.add_argument("--subject")
+    preview_parser.add_argument("--instruction", default="")
+    preview_parser.set_defaults(func=cmd_gmail_preview)
     draft_parser = gmail_sub.add_parser("draft", help="Create a Gmail draft for a meeting.")
     draft_parser.add_argument("meeting_id", type=int)
     draft_parser.add_argument("--to", default="")
@@ -168,6 +174,26 @@ def cmd_gmail_draft(args: argparse.Namespace, settings: Settings, repo: Reposito
         instruction=args.instruction,
     )
     print(f"Created Gmail draft: {draft_id}")
+    return 0
+
+
+def cmd_gmail_preview(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    preview = preview_followup_email(
+        settings,
+        repo,
+        args.meeting_id,
+        to=args.to,
+        subject=args.subject,
+        instruction=args.instruction,
+    )
+    print(f"To: {preview['to']}")
+    print(f"Subject: {preview['subject']}")
+    print(f"Tone: {preview['tone']}")
+    if preview["included_items"]:
+        print(f"Included: {', '.join(preview['included_items'])}")
+    print()
+    print(preview["body"])
     return 0
 
 

@@ -100,6 +100,7 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     meeting_id = _meeting_id_from_path(parsed.path)
                     self._send_json(
                         preview_followup_email(
+                            settings,
                             repo,
                             meeting_id,
                             to=str(payload.get("to") or ""),
@@ -116,6 +117,7 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                         to=str(payload.get("to") or ""),
                         subject=_optional(payload.get("subject")),
                         instruction=str(payload.get("instruction") or ""),
+                        body=_optional(payload.get("body")),
                     )
                     self._send_json({"draft_id": draft_id, "drafts": repo.email_drafts_for_meeting(meeting_id)})
                 else:
@@ -230,7 +232,14 @@ def settings_payload(settings: Settings) -> dict[str, Any]:
         "record_cmd": settings.record_cmd,
         "recorder_status": recorder_status,
         "recorder_command_preview": recorder_command_preview,
+        "capture_note": capture_note(settings.capture_profile),
     }
+
+
+def capture_note(profile: str) -> str:
+    if (profile or "mic").lower() == "blackhole":
+        return "BlackHole mode records routed system audio only after macOS audio routing is configured."
+    return "Mic mode records your selected/default microphone. It will not capture headphone meeting audio."
 
 
 def json_default(value: Any) -> Any:
@@ -313,12 +322,13 @@ APP_HTML = """<!doctype html>
             <div class="stack">
               <input id="email-to" placeholder="Recipient">
               <input id="email-subject" placeholder="Subject">
-              <textarea id="email-instruction" placeholder="What should this email accomplish?"></textarea>
+              <textarea id="email-instruction" placeholder="Draft instructions, e.g. make it warm, concise, and focus on next steps"></textarea>
               <div class="row">
-                <button id="email-preview">Preview</button>
+                <button id="email-preview">Generate Preview</button>
                 <button id="email-create">Create Gmail Draft</button>
               </div>
-              <pre id="email-body"></pre>
+              <textarea id="email-body" class="email-preview" placeholder="Generated draft body will appear here. You can edit it before creating the Gmail draft."></textarea>
+              <pre id="email-meta"></pre>
             </div>
           </section>
         </div>
@@ -430,6 +440,7 @@ input, textarea {
   color: var(--text);
 }
 textarea { min-height: 92px; resize: vertical; }
+.email-preview { min-height: 260px; line-height: 1.45; }
 .list { display: grid; gap: 8px; }
 .item {
   border: 1px solid var(--line);
@@ -551,10 +562,20 @@ function renderCommitments(items) {
 function renderSettings(settings) {
   const target = $("settings-list");
   target.innerHTML = "";
+  const labels = {
+    openai_key_present: "OpenAI key configured",
+    gmail_credentials_present: "Gmail credentials file",
+    gmail_token_present: "Gmail OAuth token",
+    capture_profile: "Capture profile",
+    input_device: "Input device",
+    capture_note: "Capture note",
+    recorder_status: "Recorder status",
+    recorder_command_preview: "Recorder command",
+  };
   Object.entries(settings).forEach(([key, value]) => {
     const k = document.createElement("div");
     const v = document.createElement("div");
-    k.textContent = key;
+    k.textContent = labels[key] || key;
     v.textContent = String(value);
     target.append(k, v);
   });
@@ -618,8 +639,9 @@ async function previewEmail() {
     body: JSON.stringify(payload),
   });
   $("email-subject").value = data.subject;
-  $("email-body").textContent = data.body;
-  setStatus("Draft preview ready");
+  $("email-body").value = data.body;
+  $("email-meta").textContent = `Tone: ${data.tone}\\nProvider: ${data.provider}\\nIncluded: ${(data.included_items || []).join(", ") || "not specified"}`;
+  setStatus(`Draft preview ready (${data.provider})`);
 }
 
 async function createEmailDraft() {
@@ -636,6 +658,7 @@ function emailPayload() {
     to: $("email-to").value,
     subject: $("email-subject").value,
     instruction: $("email-instruction").value,
+    body: $("email-body").value,
   };
 }
 

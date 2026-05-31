@@ -7,6 +7,7 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from speedwagon_ai.app import make_handler
 from speedwagon_ai.config import Settings
@@ -78,7 +79,22 @@ class AppApiTests(unittest.TestCase):
             {"to": "person@example.com", "instruction": "Focus on the decision."},
         )
         self.assertEqual(preview["to"], "person@example.com")
-        self.assertIn("Focus on the decision.", preview["body"])
+        self.assertNotIn("Focus on the decision.", preview["body"])
+        self.assertEqual(preview["provider"], "fallback")
+
+    def test_email_draft_api_uses_edited_body(self) -> None:
+        with patch("speedwagon_ai.app.create_gmail_draft", return_value="draft-1") as create_draft:
+            response = self.post_json(
+                "/api/meetings/1/email/draft",
+                {
+                    "to": "person@example.com",
+                    "subject": "Edited subject",
+                    "instruction": "Make it shorter.",
+                    "body": "Hi,\n\nThis is the edited body.\n\nThanks,",
+                },
+            )
+        self.assertEqual(response["draft_id"], "draft-1")
+        self.assertEqual(create_draft.call_args.kwargs["body"], "Hi,\n\nThis is the edited body.\n\nThanks,")
 
     def test_context_and_settings_api(self) -> None:
         context = self.get_json("/api/context?topic=API")
