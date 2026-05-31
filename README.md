@@ -19,13 +19,51 @@ speedwagon record stop
 speedwagon process <meeting-id>
 speedwagon context --topic "weekly planning"
 speedwagon commitments
+speedwagon app
 ```
 
 ## V1 Notes
 
-- Audio capture uses macOS `afrecord`.
+- Audio capture auto-detects `afrecord`, SoX `rec`, or `ffmpeg`.
 - Transcription shells out to `whisper.cpp`.
 - Extraction uses one OpenAI API call per meeting by default.
 - Data is stored locally in SQLite under `data/`.
 - Markdown notes are written under `notes/`.
 - Gmail integration creates drafts only and requires optional Google client libraries.
+
+## Local App
+
+Start the local browser UI:
+
+```bash
+speedwagon app
+```
+
+The app runs at `http://127.0.0.1:8765` by default and uses the same local SQLite database as the CLI.
+
+## Gmail Draft Instructions
+
+Create a draft with an instruction:
+
+```bash
+speedwagon gmail draft <meeting-id> \
+  --to person@example.com \
+  --instruction "Write a warm follow-up thanking them and listing next steps."
+```
+
+Gmail remains draft-only; SpeedwagonAI does not send mail automatically.
+
+## Meeting Audio With Headphones
+
+The default capture mode records your microphone. To capture meeting/system audio while using headphones, install and configure a virtual audio device such as BlackHole, then set:
+
+```env
+SPEEDWAGON_CAPTURE_PROFILE=blackhole
+SPEEDWAGON_INPUT_DEVICE=BlackHole 2ch
+```
+
+For most local testing, keep:
+
+```env
+SPEEDWAGON_CAPTURE_PROFILE=mic
+```

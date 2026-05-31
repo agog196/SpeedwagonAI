@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from speedwagon_ai.capture import Recorder
+from speedwagon_ai.app import run_app
 from speedwagon_ai.config import Settings
 from speedwagon_ai.context import render_context
 from speedwagon_ai.extraction import Extractor
@@ -32,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="Initialize local folders and SQLite database.")
     init_parser.set_defaults(func=cmd_init)
+
+    app_parser = subparsers.add_parser("app", help="Start the local SpeedwagonAI web app.")
+    app_parser.add_argument("--host")
+    app_parser.add_argument("--port", type=int)
+    app_parser.set_defaults(func=cmd_app)
 
     record_parser = subparsers.add_parser("record", help="Start or stop local audio recording.")
     record_sub = record_parser.add_subparsers(dest="record_command", required=True)
@@ -68,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft_parser.add_argument("meeting_id", type=int)
     draft_parser.add_argument("--to", default="")
     draft_parser.add_argument("--subject")
+    draft_parser.add_argument("--instruction", default="")
     draft_parser.set_defaults(func=cmd_gmail_draft)
 
     return parser
@@ -84,6 +91,12 @@ def cmd_init(args: argparse.Namespace, settings: Settings, repo: Repository) -> 
         print("Created .env from .env.example")
     print(f"Initialized database at {settings.db_path}")
     print(f"Notes directory: {settings.notes_dir}")
+    return 0
+
+
+def cmd_app(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    run_app(settings, repo, host=args.host or settings.app_host, port=args.port or settings.app_port)
     return 0
 
 
@@ -146,7 +159,14 @@ def cmd_commitments(args: argparse.Namespace, settings: Settings, repo: Reposito
 
 def cmd_gmail_draft(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
     repo.init()
-    draft_id = create_gmail_draft(settings, repo, args.meeting_id, to=args.to, subject=args.subject)
+    draft_id = create_gmail_draft(
+        settings,
+        repo,
+        args.meeting_id,
+        to=args.to,
+        subject=args.subject,
+        instruction=args.instruction,
+    )
     print(f"Created Gmail draft: {draft_id}")
     return 0
 

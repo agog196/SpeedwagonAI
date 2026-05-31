@@ -25,7 +25,11 @@ class Settings:
     audio_dir: Path
     transcripts_dir: Path
     state_path: Path
+    app_host: str
+    app_port: int
     record_cmd: str
+    capture_profile: str
+    input_device: str
     whisper_cpp_bin: str
     whisper_cpp_model: str
     llm_provider: str
@@ -44,7 +48,11 @@ class Settings:
             audio_dir=Path(os.getenv("SPEEDWAGON_AUDIO_DIR", "audio")),
             transcripts_dir=Path(os.getenv("SPEEDWAGON_TRANSCRIPTS_DIR", "transcripts")),
             state_path=Path(os.getenv("SPEEDWAGON_STATE_PATH", "data/recording.json")),
+            app_host=os.getenv("SPEEDWAGON_APP_HOST", "127.0.0.1"),
+            app_port=int(os.getenv("SPEEDWAGON_APP_PORT", "8765")),
             record_cmd=os.getenv("SPEEDWAGON_RECORD_CMD", ""),
+            capture_profile=os.getenv("SPEEDWAGON_CAPTURE_PROFILE", "mic"),
+            input_device=os.getenv("SPEEDWAGON_INPUT_DEVICE", ""),
             whisper_cpp_bin=os.getenv("WHISPER_CPP_BIN", ""),
             whisper_cpp_model=os.getenv("WHISPER_CPP_MODEL", ""),
             llm_provider=os.getenv("LLM_PROVIDER", "openai"),

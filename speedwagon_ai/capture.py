@@ -24,7 +24,12 @@ class Recorder:
             raise RuntimeError("A recording is already in progress. Run `speedwagon record stop` first.")
         meeting = self.repo.create_meeting(title)
         audio_path = self.settings.audio_dir / f"meeting-{meeting.id}.wav"
-        command = recorder_command(self.settings.record_cmd, audio_path)
+        command = recorder_command(
+            self.settings.record_cmd,
+            audio_path,
+            profile=self.settings.capture_profile,
+            input_device=self.settings.input_device,
+        )
         proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         state = {
             "meeting_id": meeting.id,
@@ -55,21 +60,33 @@ class Recorder:
         return meeting_id
 
 
-def recorder_command(configured_command: str, audio_path: Path) -> list[str]:
+def recorder_command(
+    configured_command: str,
+    audio_path: Path,
+    profile: str = "mic",
+    input_device: str = "",
+) -> list[str]:
     if configured_command:
         command = shlex.split(configured_command)
         return [part.format(output=str(audio_path)) for part in command]
 
+    normalized_profile = (profile or "mic").lower()
     afrecord = shutil.which("afrecord")
-    if afrecord:
+    if afrecord and normalized_profile == "mic":
         return [afrecord, "-f", "WAVE", str(audio_path)]
 
     rec = shutil.which("rec")
     if rec:
+        if normalized_profile == "blackhole":
+            device = input_device or "BlackHole 2ch"
+            return [rec, "-t", "coreaudio", device, "-c", "2", "-r", "48000", str(audio_path)]
         return [rec, "-c", "1", "-r", "16000", str(audio_path)]
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
+        if normalized_profile == "blackhole":
+            device = input_device or "BlackHole 2ch"
+            return [ffmpeg, "-f", "avfoundation", "-i", f":{device}", "-ac", "2", "-ar", "48000", str(audio_path)]
         return [ffmpeg, "-f", "avfoundation", "-i", ":0", "-ac", "1", "-ar", "16000", str(audio_path)]
 
     raise RuntimeError(

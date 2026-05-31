@@ -7,6 +7,7 @@ from pathlib import Path
 
 from speedwagon_ai.config import Settings
 from speedwagon_ai.extraction import parse_extraction
+from speedwagon_ai.integrations.gmail import preview_followup_email, render_followup_body
 from speedwagon_ai.models import ExtractionResult, ExtractedItem
 from speedwagon_ai.output import MarkdownWriter, render_commitments_markdown, render_meeting_markdown
 from speedwagon_ai.storage import Repository
@@ -22,7 +23,11 @@ class StorageOutputTests(unittest.TestCase):
             audio_dir=root / "audio",
             transcripts_dir=root / "transcripts",
             state_path=root / "data" / "recording.json",
+            app_host="127.0.0.1",
+            app_port=8765,
             record_cmd="",
+            capture_profile="mic",
+            input_device="",
             whisper_cpp_bin="",
             whisper_cpp_model="",
             llm_provider="openai",
@@ -83,6 +88,40 @@ class StorageOutputTests(unittest.TestCase):
         commitments_path = writer.write_commitments()
         self.assertTrue(note_path.exists())
         self.assertTrue(commitments_path.exists())
+
+    def test_instruction_based_email_preview_and_audit_storage(self) -> None:
+        meeting = self.repo.create_meeting("Partner Sync")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Discussed launch next steps.",
+                action_items=[ExtractedItem("Send launch notes", owner="Anish", deadline="Monday")],
+                decisions=["Launch next week"],
+                raw={"summary": "Discussed launch next steps."},
+            ),
+        )
+        preview = preview_followup_email(
+            self.repo,
+            meeting.id,
+            to="person@example.com",
+            instruction="Make it warm and focus on next steps.",
+        )
+        self.assertEqual(preview["to"], "person@example.com")
+        self.assertIn("Focus for this draft: Make it warm", preview["body"])
+        self.assertIn("Send launch notes", preview["body"])
+
+        draft_id = self.repo.save_email_draft(
+            meeting_id=meeting.id,
+            provider="gmail",
+            provider_draft_id="draft-123",
+            recipient="person@example.com",
+            subject=preview["subject"],
+            instruction="Make it warm and focus on next steps.",
+            body=preview["body"],
+        )
+        drafts = self.repo.email_drafts_for_meeting(meeting.id)
+        self.assertEqual(drafts[0]["id"], draft_id)
+        self.assertEqual(drafts[0]["provider_draft_id"], "draft-123")
 
 
 class ExtractionParsingTests(unittest.TestCase):

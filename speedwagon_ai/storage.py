@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS entities (
     name TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS email_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_draft_id TEXT,
+    recipient TEXT,
+    subject TEXT NOT NULL,
+    instruction TEXT,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -234,6 +246,41 @@ class Repository:
             "decisions": [dict(row) for row in decisions],
             "unresolved": self.unresolved_work(),
         }
+
+    def save_email_draft(
+        self,
+        meeting_id: int,
+        provider: str,
+        provider_draft_id: str | None,
+        recipient: str,
+        subject: str,
+        instruction: str | None,
+        body: str,
+    ) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO email_drafts (
+                    meeting_id, provider, provider_draft_id, recipient, subject, instruction, body, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (meeting_id, provider, provider_draft_id, recipient, subject, instruction, body, now),
+            )
+            return int(cur.lastrowid)
+
+    def email_drafts_for_meeting(self, meeting_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM email_drafts
+                WHERE meeting_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (meeting_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _meeting_from_row(row: sqlite3.Row) -> Meeting:
