@@ -27,6 +27,60 @@ public struct CommitmentListResponse: Codable, Equatable {
     public let commitments: [TaskItem]?
 }
 
+public struct MeetingListResponse: Codable, Equatable {
+    public let meetings: [MeetingItem]
+}
+
+public struct MeetingDetailResponse: Codable, Equatable {
+    public let meeting: MeetingItem
+    public let actionItems: [MeetingTextItem]
+    public let commitments: [MeetingTextItem]
+    public let decisions: [MeetingTextItem]
+    public let openQuestions: [MeetingTextItem]
+    public let keyTopics: [MeetingTextItem]
+    public let entities: [MeetingTextItem]
+    public let emailDrafts: [JSONValue]?
+    public let transcript: String?
+}
+
+public struct MeetingProcessResponse: Codable, Equatable {
+    public let meeting: MeetingItem
+    public let transcriptPath: String?
+    public let notePath: String?
+    public let commitmentsPath: String?
+}
+
+public struct ContextItem: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let name: String
+    public let normalizedName: String?
+    public let kind: String
+    public let confidence: Double?
+    public let reason: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+
+    public init(
+        id: Int,
+        name: String,
+        normalizedName: String? = nil,
+        kind: String,
+        confidence: Double? = nil,
+        reason: String? = nil,
+        createdAt: String? = nil,
+        updatedAt: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.normalizedName = normalizedName
+        self.kind = kind
+        self.confidence = confidence
+        self.reason = reason
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct TaskItem: Codable, Identifiable, Equatable {
     public let id: Int
     public let text: String
@@ -47,6 +101,7 @@ public struct TaskItem: Codable, Identifiable, Equatable {
     public let completedAt: String?
     public let createdAt: String?
     public let updatedAt: String?
+    public let contexts: [ContextItem]?
 
     public init(
         id: Int,
@@ -67,7 +122,8 @@ public struct TaskItem: Codable, Identifiable, Equatable {
         snoozedUntil: String? = nil,
         completedAt: String? = nil,
         createdAt: String? = nil,
-        updatedAt: String? = nil
+        updatedAt: String? = nil,
+        contexts: [ContextItem]? = nil
     ) {
         self.id = id
         self.text = text
@@ -88,6 +144,7 @@ public struct TaskItem: Codable, Identifiable, Equatable {
         self.completedAt = completedAt
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.contexts = contexts
     }
 
     public var isDone: Bool {
@@ -195,9 +252,15 @@ public struct AssistantResult: Codable, Equatable {
     public let commitments: Int?
     public let pendingAction: PendingAssistantAction?
     public let pendingActions: [PendingAssistantAction]?
+    public let contexts: [ContextItem]?
+    public let context: ContextItem?
+    public let suggestions: [SuggestionItem]?
+    public let suggestion: SuggestionItem?
     public let query: String?
     public let enabled: Bool?
     public let results: [JSONValue]?
+    public let sessions: [BotSession]?
+    public let session: BotSession?
 
     public var hasTaskMutation: Bool {
         task != nil
@@ -227,6 +290,157 @@ public struct MeetingItem: Codable, Identifiable, Equatable {
     public let transcriptPath: String?
     public let notePath: String?
     public let summary: String?
+    public let sourceType: String?
+}
+
+public struct MeetingTextItem: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let meetingId: Int?
+    public let text: String?
+    public let topic: String?
+    public let name: String?
+    public let owner: String?
+    public let deadline: String?
+    public let status: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+
+    public var displayText: String {
+        text ?? topic ?? name ?? ""
+    }
+}
+
+public struct SuggestionListResponse: Codable, Equatable {
+    public let suggestions: [SuggestionItem]
+}
+
+public struct NotificationCandidateListResponse: Codable, Equatable {
+    public let candidates: [SuggestionItem]
+}
+
+public struct NotificationStatusResponse: Codable, Equatable {
+    public let enabled: Bool
+    public let delivery: String
+    public let runtime: String
+    public let permissionOwner: String?
+    public let candidateCount: Int
+    public let deliveredCount: Int
+    public let dismissedCount: Int
+    public let snoozedCount: Int
+    public let note: String
+}
+
+public struct NotificationEnvelope: Codable, Equatable {
+    public let suggestion: SuggestionItem
+    public let notification: NotificationAuditItem?
+}
+
+public struct NotificationAuditItem: Codable, Equatable, Identifiable {
+    public let id: Int
+    public let suggestionId: Int
+    public let sourceFingerprint: String?
+    public let scheduledAt: String?
+    public let deliveredAt: String?
+    public let status: String
+    public let reason: String?
+    public let actionTaken: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+}
+
+public struct SuggestionEnvelope: Codable, Equatable {
+    public let suggestion: SuggestionItem
+}
+
+public struct ContextGraphResponse: Codable, Equatable {
+    public let query: String
+    public let contexts: [ContextItem]
+    public let tasks: [TaskItem]
+    public let meetings: [MeetingItem]
+    public let suggestions: [SuggestionItem]
+}
+
+public struct SuggestionItem: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let title: String
+    public let reason: String
+    public let status: String
+    public let confidence: Double?
+    public let contextId: Int?
+    public let contextName: String?
+    public let contextKind: String?
+    public let context: ContextItem?
+    public let proposedAction: String
+    public let payload: [String: JSONValue]?
+    public let taskIds: [Int]
+    public let meetingIds: [Int]
+    public let sourceFingerprint: String?
+    public let retiredAt: String?
+    public let nextNotifyAt: String?
+    public let lastNotifiedAt: String?
+    public let notificationReason: String?
+    public let notificationStatus: String?
+    public let snoozedUntil: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+
+    public init(
+        id: Int,
+        title: String,
+        reason: String,
+        status: String,
+        confidence: Double? = nil,
+        contextId: Int? = nil,
+        contextName: String? = nil,
+        contextKind: String? = nil,
+        context: ContextItem? = nil,
+        proposedAction: String,
+        payload: [String: JSONValue]? = nil,
+        taskIds: [Int] = [],
+        meetingIds: [Int] = [],
+        sourceFingerprint: String? = nil,
+        retiredAt: String? = nil,
+        nextNotifyAt: String? = nil,
+        lastNotifiedAt: String? = nil,
+        notificationReason: String? = nil,
+        notificationStatus: String? = nil,
+        snoozedUntil: String? = nil,
+        createdAt: String? = nil,
+        updatedAt: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.reason = reason
+        self.status = status
+        self.confidence = confidence
+        self.contextId = contextId
+        self.contextName = contextName
+        self.contextKind = contextKind
+        self.context = context
+        self.proposedAction = proposedAction
+        self.payload = payload
+        self.taskIds = taskIds
+        self.meetingIds = meetingIds
+        self.sourceFingerprint = sourceFingerprint
+        self.retiredAt = retiredAt
+        self.nextNotifyAt = nextNotifyAt
+        self.lastNotifiedAt = lastNotifiedAt
+        self.notificationReason = notificationReason
+        self.notificationStatus = notificationStatus
+        self.snoozedUntil = snoozedUntil
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    public var displayContext: String? {
+        if let context, !context.name.isEmpty {
+            return context.name
+        }
+        if let contextName, !contextName.isEmpty {
+            return contextName
+        }
+        return nil
+    }
 }
 
 public struct EmailDraftPreview: Codable, Equatable {
@@ -249,7 +463,72 @@ public struct DailyBriefResponse: Codable, Equatable {
     public let stale: [TaskItem]
     public let unscheduled: [TaskItem]
     public let recommendedFollowups: [TaskItem]
+    public let calendarToday: [CalendarEvent]?
+    public let calendarUpcoming: [CalendarEvent]?
+    public let meetingPrep: [MeetingPrepItem]?
+    public let notificationCandidates: [SuggestionItem]?
     public let counts: [String: Int]
+}
+
+public struct CalendarStatusResponse: Codable, Equatable {
+    public let enabled: Bool
+    public let provider: String?
+    public let status: String
+    public let note: String
+    public let credentialsPresent: Bool?
+    public let tokenPresent: Bool?
+    public let calendarScopePresent: Bool?
+    public let calendarIds: [String]?
+    public let syncDaysBack: Int?
+    public let syncDaysForward: Int?
+}
+
+public struct CalendarEventListResponse: Codable, Equatable {
+    public let events: [CalendarEvent]
+}
+
+public struct CalendarSyncResponse: Codable, Equatable {
+    public let status: String
+    public let provider: String?
+    public let calendarIds: [String]?
+    public let timeMin: String?
+    public let timeMax: String?
+    public let syncedCount: Int
+    public let events: [CalendarEvent]
+}
+
+public struct CalendarEvent: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let provider: String?
+    public let providerEventId: String?
+    public let calendarId: String?
+    public let title: String
+    public let descriptionSnippet: String?
+    public let startAt: String
+    public let endAt: String
+    public let timezone: String?
+    public let location: String?
+    public let meetingUrl: String?
+    public let attendees: [CalendarAttendee]?
+    public let status: String?
+    public let htmlLink: String?
+    public let rawJsonPath: String?
+    public let lastSyncedAt: String?
+}
+
+public struct CalendarAttendee: Codable, Equatable {
+    public let email: String?
+    public let displayName: String?
+    public let responseStatus: String?
+}
+
+public struct MeetingPrepItem: Codable, Equatable {
+    public let event: CalendarEvent
+    public let query: String?
+    public let contexts: [ContextItem]?
+    public let tasks: [TaskItem]?
+    public let meetings: [MeetingItem]?
+    public let decisions: [JSONValue]?
 }
 
 public struct SettingsResponse: Codable, Equatable {
@@ -267,31 +546,134 @@ public struct SettingsResponse: Codable, Equatable {
     public let webSearchEnabled: Bool?
     public let gmailCredentialsPresent: Bool?
     public let gmailTokenPresent: Bool?
+    public let calendarStatus: String?
+    public let calendarEnabled: Bool?
+    public let calendarNote: String?
+    public let calendarIds: [String]?
+    public let calendarSyncDaysBack: Int?
+    public let calendarSyncDaysForward: Int?
     public let captureProfile: String?
     public let inputDevice: String?
     public let recorderStatus: String?
     public let captureNote: String?
+    public let nativeCaptureAvailable: Bool?
+    public let nativeCaptureDefault: String?
+    public let nativeCaptureNote: String?
+    public let botProvider: String?
+    public let botConfigured: Bool?
+    public let botNote: String?
+}
+
+public struct BotStatusResponse: Codable, Equatable {
+    public let enabled: Bool
+    public let provider: String?
+    public let status: String?
+    public let note: String?
+    public let requiresConsent: Bool?
+    public let defaultBotName: String?
+    public let botName: String?
+    public let cloudCostLabel: String?
+    public let sessions: [BotSession]?
+    public let sessionCount: Int?
+}
+
+public struct BotSessionListResponse: Codable, Equatable {
+    public let sessions: [BotSession]
+}
+
+public struct BotSessionEnvelope: Codable, Equatable {
+    public let session: BotSession
+}
+
+public struct BotJoinResponse: Codable, Equatable {
+    public let session: BotSession
+    public let meeting: MeetingItem?
+    public let providerResponse: JSONValue?
+}
+
+public struct BotProcessResponse: Codable, Equatable {
+    public let session: BotSession
+    public let meeting: MeetingItem
+    public let transcriptPath: String?
+    public let notePath: String?
+    public let commitmentsPath: String?
+}
+
+public struct BotSession: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let provider: String
+    public let providerBotId: String?
+    public let meetingId: Int
+    public let meetingUrlDisplay: String?
+    public let title: String
+    public let status: String
+    public let joinAt: String?
+    public let transcriptPath: String?
+    public let rawMetadataPath: String?
+    public let lastSyncAt: String?
+    public let error: String?
+    public let consentConfirmed: Bool?
+    public let createdAt: String?
+    public let updatedAt: String?
+    public let meetingTitle: String?
+    public let meetingSummary: String?
+    public let meetingTranscriptPath: String?
+    public let meetingNotePath: String?
+    public let transcriptReady: Bool?
+    public let processed: Bool?
+
+    public var displayTitle: String {
+        title.isEmpty ? (meetingTitle ?? "Bot session \(id)") : title
+    }
+}
+
+public struct BotJoinRequest: Codable, Equatable {
+    public let meetingUrl: String
+    public let title: String
+    public let joinAt: String?
+    public let botName: String?
+    public let consentConfirmed: Bool
+
+    public init(meetingUrl: String, title: String, joinAt: String? = nil, botName: String? = nil, consentConfirmed: Bool) {
+        self.meetingUrl = meetingUrl
+        self.title = title
+        self.joinAt = joinAt
+        self.botName = botName
+        self.consentConfirmed = consentConfirmed
+    }
 }
 
 public struct CaptureSession: Codable, Equatable {
     public let active: Bool?
+    public let native: Bool?
+    public let status: String?
+    public let sessionId: String?
     public let kind: String?
+    public let mode: String?
     public let title: String?
     public let meetingId: Int?
     public let pid: Int?
     public let audioPath: String?
+    public let systemAudioPath: String?
+    public let microphoneAudioPath: String?
     public let logPath: String?
     public let command: [String]?
     public let captureProfile: String?
     public let inputDevice: String?
     public let startedAt: String?
+    public let endedAt: String?
     public let fileSize: Int?
     public let outputFileOk: Bool?
     public let logTail: String?
+    public let warnings: [String]?
     public let lastError: String?
 
     public var isActive: Bool {
         active == true
+    }
+
+    public var isNative: Bool {
+        native == true || captureProfile == "native_screencapturekit"
     }
 }
 
@@ -321,6 +703,42 @@ public struct CaptureStartResponse: Codable, Equatable {
     public let session: CaptureSession
 }
 
+public struct NativeCapturePrepareRequest: Codable, Equatable {
+    public let kind: String
+    public let title: String
+    public let mode: String
+
+    public init(kind: String = "meeting", title: String, mode: String = "system_mic") {
+        self.kind = kind
+        self.title = title
+        self.mode = mode
+    }
+}
+
+public struct NativeCaptureCompleteRequest: Codable, Equatable {
+    public let sessionId: String
+    public let audioPath: String
+    public let process: Bool
+    public let warnings: [String]
+
+    public init(sessionId: String, audioPath: String, process: Bool = false, warnings: [String] = []) {
+        self.sessionId = sessionId
+        self.audioPath = audioPath
+        self.process = process
+        self.warnings = warnings
+    }
+}
+
+public struct NativeCaptureFailRequest: Codable, Equatable {
+    public let sessionId: String
+    public let error: String
+
+    public init(sessionId: String, error: String) {
+        self.sessionId = sessionId
+        self.error = error
+    }
+}
+
 public struct CaptureStopResponse: Codable, Equatable {
     public let session: CaptureSession
     public let meetingId: Int?
@@ -341,6 +759,8 @@ public struct CaptureDiagnostics: Codable, Equatable {
     public let recorderStatus: String
     public let recorderCommandPreview: String
     public let activeSession: CaptureSession
+    public let nativeCapture: CaptureSession?
+    public let nativeCaptureNote: String?
     public let recentLogTail: String
     public let outputFileOk: Bool
     public let warnings: [String]

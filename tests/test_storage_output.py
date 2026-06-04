@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import date
@@ -38,12 +39,59 @@ class StorageOutputTests(unittest.TestCase):
             anthropic_api_key="",
             gmail_credentials_path=root / "data" / "google_credentials.json",
             gmail_token_path=root / "data" / "google_token.json",
+            google_calendar_token_path=root / "data" / "google_calendar_token.json",
         )
         self.repo = Repository(self.settings.db_path)
         self.repo.init()
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_init_migrates_old_suggestion_lifecycle_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "speedwagon.db"
+            db_path.parent.mkdir(parents=True)
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE contexts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL UNIQUE,
+                        kind TEXT NOT NULL DEFAULT 'topic',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE suggestions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open',
+                        confidence REAL NOT NULL DEFAULT 0.7,
+                        context_id INTEGER REFERENCES contexts(id) ON DELETE SET NULL,
+                        proposed_action TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        task_ids_json TEXT NOT NULL DEFAULT '[]',
+                        meeting_ids_json TEXT NOT NULL DEFAULT '[]',
+                        snoozed_until TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+
+            repo = Repository(db_path)
+            repo.init()
+
+            with sqlite3.connect(db_path) as conn:
+                suggestion_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(suggestions)").fetchall()
+                }
+                self.assertIn("source_fingerprint", suggestion_columns)
+                self.assertIn("notification_status", suggestion_columns)
+                indexes = {row[1] for row in conn.execute("PRAGMA index_list(suggestions)").fetchall()}
+                self.assertIn("idx_suggestions_source_fingerprint", indexes)
+                conn.execute("SELECT 1 FROM suggestion_notifications LIMIT 1").fetchall()
 
     def test_schema_crud_and_markdown(self) -> None:
         meeting = self.repo.create_meeting("Weekly Planning", audio_path="audio/meeting-1.wav")
@@ -148,6 +196,136 @@ class StorageOutputTests(unittest.TestCase):
         markdown = render_commitments_markdown(self.repo.list_tasks(status="open"))
         self.assertIn("[manual] Manual reminder due 2026-06-01", markdown)
         self.assertIn("[[Manual task]]", markdown)
+
+    def test_context_graph_links_tasks_and_creates_followup_suggestion(self) -> None:
+        blocker = self.repo.create_task("Finish DairyMGT Repro tab graphs", project="DairyMGT", due_date="2026-06-07")
+        email = self.repo.create_task("Email Megan about DairyMGT updates", project="DairyMGT")
+
+        graph = self.repo.context_graph("DairyMGT")
+        self.assertTrue(any(context["name"] == "DairyMGT" for context in graph["contexts"]))
+        self.assertEqual({task["id"] for task in graph["tasks"]}, {blocker["id"], email["id"]})
+        self.assertTrue(self.repo.get_task(email["id"])["contexts"])
+
+        self.repo.complete_task(blocker["id"])
+        suggestions = self.repo.list_suggestions(status="open")
+
+        self.assertTrue(any(item["proposed_action"] == "draft_email_from_context" for item in suggestions))
+        followup = next(item for item in suggestions if item["proposed_action"] == "draft_email_from_context")
+        self.assertEqual(followup["context"]["name"], "DairyMGT")
+        self.assertIn(email["id"], followup["task_ids"])
+
+    def test_followup_suggestions_are_deduped_per_email_task(self) -> None:
+        meeting = self.repo.create_meeting("testMeet")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Discussed sending a project update and reviewing next steps.",
+                action_items=[
+                    ExtractedItem("Send project update email to Megan"),
+                    ExtractedItem("Review the next steps"),
+                ],
+                key_topics=["project update", "next steps"],
+                raw={"summary": "Discussed sending a project update and reviewing next steps."},
+            ),
+        )
+        tasks = self.repo.list_tasks_for_meeting(meeting.id)
+        blocker = next(task for task in tasks if task["text"] == "Review the next steps")
+        email = next(task for task in tasks if task["text"] == "Send project update email to Megan")
+
+        self.repo.complete_task(blocker["id"])
+        suggestions = [
+            item
+            for item in self.repo.list_suggestions(status="open", limit=20)
+            if item["proposed_action"] == "draft_email_from_context"
+            and (item.get("payload") or {}).get("task_id") == email["id"]
+        ]
+
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["context"]["name"], "project update")
+
+    def test_extracted_meeting_tasks_inherit_meeting_context(self) -> None:
+        meeting = self.repo.create_meeting("DairyMGT planning")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Discussed DairyMGT release follow-through.",
+                action_items=[ExtractedItem("Email Clara with the DairyMGT release notes")],
+                key_topics=["DairyMGT"],
+                entities=["Clara"],
+                raw={"summary": "Discussed DairyMGT release follow-through."},
+            ),
+        )
+
+        task = self.repo.list_tasks_for_meeting(meeting.id)[0]
+        contexts = {context["name"] for context in task["contexts"]}
+
+        self.assertIn("DairyMGT", contexts)
+        self.assertIn("Clara", contexts)
+        self.assertTrue(any(context["name"] == "DairyMGT" for context in self.repo.contexts_for_meeting(meeting.id)))
+
+    def test_suggestion_status_lifecycle(self) -> None:
+        suggestion = self.repo.create_suggestion(
+            title="Review stale work",
+            reason="A task looks stale.",
+            proposed_action="search_tasks",
+            payload={"query": "stale"},
+            confidence=0.7,
+        )
+
+        snoozed = self.repo.update_suggestion_status(suggestion["id"], "snoozed", snoozed_until="2026-06-08")
+        dismissed = self.repo.update_suggestion_status(suggestion["id"], "dismissed")
+
+        self.assertEqual(snoozed["snoozed_until"], "2026-06-08")
+        self.assertEqual(dismissed["status"], "dismissed")
+
+    def test_notification_candidates_and_lifecycle_retirement(self) -> None:
+        overdue = self.repo.create_task("Send overdue update", due_date="2026-06-01")
+        unscheduled = self.repo.create_task("Plan launch follow-up")
+
+        candidates = self.repo.notification_candidates()
+        candidate_ids = {item["id"] for item in candidates}
+        self.assertTrue(any(overdue["id"] in item["task_ids"] for item in candidates))
+        self.assertTrue(any(unscheduled["id"] in item["task_ids"] for item in candidates))
+        self.assertTrue(all(item["notification_reason"] for item in candidates))
+
+        delivered = self.repo.mark_notification_delivered(next(iter(candidate_ids)))
+        self.assertEqual(delivered["suggestion"]["notification_status"], "delivered")
+        self.assertIsNotNone(delivered["suggestion"]["last_notified_at"])
+
+        self.repo.complete_task(overdue["id"])
+        self.assertFalse(any(overdue["id"] in item["task_ids"] for item in self.repo.notification_candidates()))
+
+    def test_duplicate_suggestion_fingerprint_reuses_active_suggestion(self) -> None:
+        first = self.repo.create_suggestion(
+            title="Schedule task #99",
+            reason="This task has no due date.",
+            proposed_action="search_tasks",
+            payload={"task_id": 99, "query": "demo"},
+            task_ids=[99],
+        )
+        second = self.repo.create_suggestion(
+            title="Schedule task #99 again",
+            reason="This task has no due date.",
+            proposed_action="search_tasks",
+            payload={"query": "demo", "task_id": 99},
+            task_ids=[99],
+        )
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["source_fingerprint"], second["source_fingerprint"])
+
+    def test_notification_snooze_and_dismiss_update_status(self) -> None:
+        task = self.repo.create_task("Review notification controls")
+        suggestion = next(item for item in self.repo.notification_candidates() if task["id"] in item["task_ids"])
+
+        snoozed = self.repo.snooze_notification(suggestion["id"], "2026-06-09")["suggestion"]
+        self.assertEqual(snoozed["status"], "snoozed")
+        self.assertEqual(snoozed["notification_status"], "snoozed")
+        self.assertEqual(snoozed["next_notify_at"], "2026-06-09")
+
+        dismissed = self.repo.dismiss_notification(suggestion["id"])["suggestion"]
+        self.assertEqual(dismissed["status"], "dismissed")
+        self.assertEqual(dismissed["notification_status"], "dismissed")
 
     def test_writer_creates_files(self) -> None:
         meeting = self.repo.create_meeting("Demo")

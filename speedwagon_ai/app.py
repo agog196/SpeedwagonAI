@@ -10,11 +10,13 @@ from urllib.parse import parse_qs, urlparse
 
 from speedwagon_ai.assistant_actions import CAPABILITIES, run_action
 from speedwagon_ai.assistant_commands import cancel_pending_action, confirm_pending_action, execute_command
-from speedwagon_ai.capture import CaptureService
+from speedwagon_ai.capture import CaptureService, NativeCaptureService
 from speedwagon_ai.config import Settings
 from speedwagon_ai.context import render_context
 from speedwagon_ai.extraction import Extractor
+from speedwagon_ai.integrations.calendar import GoogleCalendarService
 from speedwagon_ai.integrations.gmail import create_gmail_draft, preview_followup_email
+from speedwagon_ai.meeting_bot import MeetingBotService
 from speedwagon_ai.model_router import choose_model, cost_label, web_search_enabled
 from speedwagon_ai.output import MarkdownWriter
 from speedwagon_ai.processing import process_meeting
@@ -32,6 +34,9 @@ TASK_MUTATING_ACTIONS = {
     "cancel_task",
     "mark_task_waiting",
     "mark_task_uncertain",
+    "confirm_suggestion",
+    "dismiss_suggestion",
+    "snooze_suggestion",
 }
 
 
@@ -69,6 +74,9 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/context":
                     topic = parse_qs(parsed.query).get("topic", [""])[0]
                     self._send_json({"topic": topic, "markdown": render_context(repo, topic)})
+                elif parsed.path == "/api/context-graph":
+                    query = parse_qs(parsed.query).get("query", [""])[0]
+                    self._send_json(repo.context_graph(query))
                 elif parsed.path == "/api/commitments":
                     query = parse_qs(parsed.query)
                     status = query.get("status", [""])[0] or None
@@ -84,6 +92,27 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json({"items": items, "commitments": items})
                 elif parsed.path == "/api/daily-brief":
                     self._send_json(repo.daily_brief())
+                elif parsed.path == "/api/calendar/status":
+                    self._send_json(GoogleCalendarService(settings, repo).status())
+                elif parsed.path == "/api/calendar/events":
+                    query = parse_qs(parsed.query)
+                    start = query.get("from", [""])[0] or None
+                    end = query.get("to", [""])[0] or None
+                    limit = int(query.get("limit", ["50"])[0])
+                    self._send_json(GoogleCalendarService(settings, repo).events(start_date=start, end_date=end, limit=limit))
+                elif parsed.path == "/api/calendar/upcoming":
+                    limit = int(parse_qs(parsed.query).get("limit", ["10"])[0])
+                    self._send_json(GoogleCalendarService(settings, repo).upcoming(limit=limit))
+                elif parsed.path == "/api/suggestions":
+                    query = parse_qs(parsed.query)
+                    status = query.get("status", ["open"])[0] or None
+                    limit = int(query.get("limit", ["20"])[0])
+                    self._send_json({"suggestions": repo.list_suggestions(status=status, limit=limit)})
+                elif parsed.path == "/api/notifications/status":
+                    self._send_json(repo.notification_status())
+                elif parsed.path == "/api/notifications/candidates":
+                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    self._send_json({"candidates": repo.notification_candidates(limit=limit)})
                 elif parsed.path == "/api/assistant/capabilities":
                     self._send_json({"capabilities": CAPABILITIES})
                 elif parsed.path == "/api/assistant/actions":
@@ -104,11 +133,28 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/tasks/record/state":
                     self._send_json(VoiceTaskRecorder(settings, repo).state())
                 elif parsed.path == "/api/capture/status":
-                    self._send_json(CaptureService(settings, repo).status())
+                    local_status = CaptureService(settings, repo).status()
+                    native_status = NativeCaptureService(settings, repo).status()
+                    if native_status.get("active"):
+                        self._send_json(native_status)
+                    else:
+                        self._send_json({**local_status, "native_session": native_status})
                 elif parsed.path == "/api/capture/diagnostics":
-                    self._send_json(CaptureService(settings, repo).diagnostics())
+                    diagnostics = CaptureService(settings, repo).diagnostics()
+                    diagnostics["native_capture"] = NativeCaptureService(settings, repo).status()
+                    diagnostics["native_capture_note"] = (
+                        "Native meeting capture uses ScreenCaptureKit for system audio and microphone where macOS supports it."
+                    )
+                    self._send_json(diagnostics)
                 elif parsed.path == "/api/capture/bot/status":
-                    self._send_json(bot_capture_status())
+                    self._send_json(MeetingBotService(settings, repo).status())
+                elif parsed.path == "/api/capture/bot/sessions":
+                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    status = parse_qs(parsed.query).get("status", [""])[0] or None
+                    self._send_json({"sessions": MeetingBotService(settings, repo).sessions(limit=limit, status=status)})
+                elif parsed.path.startswith("/api/capture/bot/sessions/"):
+                    session_id = _bot_session_id_from_path(parsed.path)
+                    self._send_json({"session": repo.get_bot_session(session_id)})
                 elif parsed.path == "/api/integrations/google/status":
                     self._send_json(google_status(settings))
                 elif parsed.path == "/api/integrations/apple/reminders":
@@ -173,11 +219,64 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                             "commitments_path": str(result["commitments_path"]),
                         }
                     )
-                elif parsed.path == "/api/capture/bot/join":
-                    self._send_error(
-                        HTTPStatus.NOT_IMPLEMENTED,
-                        "Meeting bot capture is planned as an opt-in managed-provider beta and is not configured yet.",
+                elif parsed.path == "/api/capture/native/prepare":
+                    repo.init()
+                    session = NativeCaptureService(settings, repo).prepare(
+                        kind=str(payload.get("kind") or "meeting"),
+                        title=str(payload.get("title") or ""),
+                        mode=str(payload.get("mode") or "system_mic"),
                     )
+                    self._send_json({"session": session})
+                elif parsed.path == "/api/capture/native/complete":
+                    repo.init()
+                    process_after_stop = bool(payload.get("process"))
+                    session = NativeCaptureService(settings, repo).complete(
+                        session_id=str(payload.get("session_id") or ""),
+                        audio_path=str(payload.get("audio_path") or ""),
+                        process=process_after_stop,
+                        warnings=[str(item) for item in payload.get("warnings") or []],
+                    )
+                    result: dict[str, Any] = {"session": session, "meeting_id": int(session["meeting_id"])}
+                    if process_after_stop:
+                        processed = process_meeting(settings, repo, int(session["meeting_id"]))
+                        result.update(
+                            {
+                                "meeting": meeting_to_dict(processed["meeting"]),
+                                "transcript_path": str(processed["transcript_path"]),
+                                "note_path": str(processed["note_path"]),
+                                "commitments_path": str(processed["commitments_path"]),
+                            }
+                        )
+                    self._send_json(result)
+                elif parsed.path == "/api/capture/native/fail":
+                    repo.init()
+                    session = NativeCaptureService(settings, repo).fail(
+                        session_id=str(payload.get("session_id") or ""),
+                        error=str(payload.get("error") or "Native capture failed."),
+                    )
+                    self._send_json({"session": session})
+                elif parsed.path == "/api/capture/bot/join":
+                    repo.init()
+                    self._send_json(
+                        MeetingBotService(settings, repo).join(
+                            meeting_url=str(payload.get("meeting_url") or ""),
+                            title=str(payload.get("title") or ""),
+                            join_at=_optional(payload.get("join_at")),
+                            bot_name=_optional(payload.get("bot_name")),
+                            consent_confirmed=bool(payload.get("consent_confirmed")),
+                        )
+                    )
+                elif parsed.path.startswith("/api/capture/bot/sessions/") and parsed.path.endswith("/sync"):
+                    repo.init()
+                    self._send_json(MeetingBotService(settings, repo).sync(_bot_session_id_from_path(parsed.path)))
+                elif parsed.path.startswith("/api/capture/bot/sessions/") and parsed.path.endswith("/process"):
+                    repo.init()
+                    self._send_json(
+                        MeetingBotService(settings, repo).process(_bot_session_id_from_path(parsed.path))
+                    )
+                elif parsed.path == "/api/calendar/sync":
+                    repo.init()
+                    self._send_json(GoogleCalendarService(settings, repo).sync())
                 elif parsed.path == "/api/assistant/voice/start":
                     repo.init()
                     session = CaptureService(settings, repo).start("assistant_voice")
@@ -239,6 +338,34 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     task = repo.cancel_task(task_id)
                     MarkdownWriter(settings, repo).write_commitments()
                     self._send_json({"task": task, "commitment": task})
+                elif parsed.path.startswith("/api/suggestions/") and parsed.path.endswith("/confirm"):
+                    suggestion_id = _suggestion_id_from_path(parsed.path)
+                    response = run_action(settings, repo, "confirm_suggestion", {"suggestion_id": suggestion_id})
+                    if response.get("action_result", {}).get("task"):
+                        MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json(response)
+                elif parsed.path.startswith("/api/suggestions/") and parsed.path.endswith("/dismiss"):
+                    suggestion_id = _suggestion_id_from_path(parsed.path)
+                    self._send_json(run_action(settings, repo, "dismiss_suggestion", {"suggestion_id": suggestion_id}))
+                elif parsed.path.startswith("/api/suggestions/") and parsed.path.endswith("/snooze"):
+                    suggestion_id = _suggestion_id_from_path(parsed.path)
+                    self._send_json(
+                        run_action(
+                            settings,
+                            repo,
+                            "snooze_suggestion",
+                            {"suggestion_id": suggestion_id, "until": _optional(payload.get("until"))},
+                        )
+                    )
+                elif parsed.path.startswith("/api/notifications/") and parsed.path.endswith("/mark-delivered"):
+                    suggestion_id = _notification_id_from_path(parsed.path)
+                    self._send_json(repo.mark_notification_delivered(suggestion_id))
+                elif parsed.path.startswith("/api/notifications/") and parsed.path.endswith("/dismiss"):
+                    suggestion_id = _notification_id_from_path(parsed.path)
+                    self._send_json(repo.dismiss_notification(suggestion_id))
+                elif parsed.path.startswith("/api/notifications/") and parsed.path.endswith("/snooze"):
+                    suggestion_id = _notification_id_from_path(parsed.path)
+                    self._send_json(repo.snooze_notification(suggestion_id, _optional(payload.get("until"))))
                 elif parsed.path == "/api/integrations/apple/reminders":
                     self._send_error(
                         HTTPStatus.NOT_IMPLEMENTED,
@@ -371,6 +498,30 @@ def _assistant_action_id_from_path(path: str) -> int:
         raise ValueError("Invalid assistant action id") from exc
 
 
+def _suggestion_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[2])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid suggestion id") from exc
+
+
+def _notification_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[2])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid notification id") from exc
+
+
+def _bot_session_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[4])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid bot session id") from exc
+
+
 def _optional(value: Any) -> str | None:
     if value is None:
         return None
@@ -407,6 +558,7 @@ def recording_state(settings: Settings) -> dict[str, Any]:
 
 def settings_payload(settings: Settings) -> dict[str, Any]:
     diagnostics = CaptureService(settings, Repository(settings.db_path)).diagnostics()
+    calendar_status = GoogleCalendarService(settings, Repository(settings.db_path)).status()
     cheap = choose_model(settings, "email_draft")
     strong = choose_model(settings, "deep_synthesis")
     command = choose_model(settings, "command_parse")
@@ -435,21 +587,37 @@ def settings_payload(settings: Settings) -> dict[str, Any]:
         "web_search_enabled": web_search_enabled(),
         "gmail_credentials_present": settings.gmail_credentials_path.exists(),
         "gmail_token_present": settings.gmail_token_path.exists(),
+        "calendar_status": calendar_status.get("status"),
+        "calendar_enabled": calendar_status.get("enabled"),
+        "calendar_note": calendar_status.get("note"),
+        "calendar_ids": calendar_status.get("calendar_ids"),
+        "calendar_sync_days_back": calendar_status.get("sync_days_back"),
+        "calendar_sync_days_forward": calendar_status.get("sync_days_forward"),
         "capture_profile": settings.capture_profile,
         "input_device": settings.input_device,
         "record_cmd": settings.record_cmd,
         "recorder_status": diagnostics["recorder_status"],
         "recorder_command_preview": diagnostics["recorder_command_preview"],
         "capture_note": capture_note(settings.capture_profile),
+        "native_capture_available": True,
+        "native_capture_default": "system_mic",
+        "native_capture_note": (
+            "Native Mac meeting capture records system audio with ScreenCaptureKit and microphone audio where allowed."
+        ),
+        "bot_provider": settings.bot_provider or "not_configured",
+        "bot_configured": MeetingBotService(settings, Repository(settings.db_path)).status().get("enabled", False),
+        "bot_note": "Meeting bot beta is optional, provider-backed, and should only join with explicit consent.",
     }
 
 
 def google_status(settings: Settings) -> dict[str, Any]:
+    calendar = GoogleCalendarService(settings, Repository(settings.db_path)).status()
     return {
         "gmail_credentials_present": settings.gmail_credentials_path.exists(),
         "gmail_token_present": settings.gmail_token_path.exists(),
         "gmail_drafts": "available" if settings.gmail_token_path.exists() else "needs_oauth",
-        "calendar": "planned",
+        "calendar": calendar["status"],
+        "calendar_status": calendar,
         "drive_docs": "planned",
     }
 
@@ -503,6 +671,8 @@ APP_HTML = """<!doctype html>
         <button class="nav active" data-view="dashboard">Dashboard</button>
         <button class="nav" data-view="record">Recorder</button>
         <button class="nav" data-view="meetings">Meetings</button>
+        <button class="nav" data-view="calendar">Calendar</button>
+        <button class="nav" data-view="notifications">Notifications</button>
         <button class="nav" data-view="tasks">Tasks</button>
         <button class="nav" data-view="commitments">Commitments</button>
         <button class="nav" data-view="settings">Settings</button>
@@ -563,6 +733,24 @@ APP_HTML = """<!doctype html>
           <h3>Diagnostics</h3>
           <pre id="capture-diagnostics"></pre>
         </section>
+        <section class="panel">
+          <h2>Meeting Bot Beta</h2>
+          <p class="meta">Optional provider-backed capture for Zoom, Meet, Teams, and similar meeting links. Bots join visibly and may incur provider cost. Refresh/sessions can request provider transcription for completed recordings.</p>
+          <div class="stack">
+            <input id="bot-title" placeholder="Meeting title">
+            <input id="bot-url" placeholder="Meeting link">
+            <label class="check-row">
+              <input id="bot-consent" type="checkbox">
+              <span>I confirm bot capture is allowed and disclosed for this meeting.</span>
+            </label>
+            <div class="row">
+              <button id="bot-join">Join Bot</button>
+              <button id="bot-refresh">Refresh Bot Sessions</button>
+            </div>
+          </div>
+          <pre id="bot-status"></pre>
+          <div id="bot-sessions" class="list"></div>
+        </section>
       </section>
 
       <section id="meetings" class="view">
@@ -618,6 +806,41 @@ APP_HTML = """<!doctype html>
           </section>
         </div>
         <div id="task-groups" class="task-groups"></div>
+      </section>
+
+      <section id="calendar" class="view">
+        <div class="grid two">
+          <section class="panel">
+            <h2>Google Calendar</h2>
+            <p class="meta">Read-only. Syncs a limited local window for daily brief and prep context.</p>
+            <div class="row">
+              <button id="calendar-sync">Sync Calendar</button>
+              <button id="calendar-refresh">Refresh Calendar</button>
+            </div>
+            <pre id="calendar-status"></pre>
+          </section>
+          <section class="panel">
+            <h2>Upcoming</h2>
+            <div id="calendar-upcoming" class="list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="notifications" class="view">
+        <div class="grid two">
+          <section class="panel">
+            <h2>Notifications</h2>
+            <p class="meta">Local candidates only. Native macOS delivery happens from the Mac app while it is running.</p>
+            <div class="row">
+              <button id="notifications-refresh">Refresh Notifications</button>
+            </div>
+            <pre id="notifications-status"></pre>
+          </section>
+          <section class="panel">
+            <h2>Candidates</h2>
+            <div id="notifications-candidates" class="list"></div>
+          </section>
+        </div>
       </section>
 
       <section id="commitments" class="view">
@@ -728,6 +951,8 @@ h3 { font-size: 14px; margin: 20px 0 10px; }
   padding: 16px;
 }
 .row { display: flex; gap: 8px; align-items: center; }
+.check-row { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 13px; }
+.check-row input { width: auto; }
 .stack { display: grid; gap: 8px; }
 input, textarea {
   width: 100%;
@@ -816,7 +1041,7 @@ function showView(name) {
 
 async function refresh() {
   try {
-    const [meetings, commitments, tasks, settings, captureStatus, taskRecordState, dailyBrief, captureDiagnostics] = await Promise.all([
+    const [meetings, commitments, tasks, settings, captureStatus, taskRecordState, dailyBrief, captureDiagnostics, botStatus, botSessions, calendarStatus, calendarUpcoming, notificationStatus, notificationCandidates] = await Promise.all([
       api("/api/meetings"),
       api("/api/commitments"),
       api("/api/tasks?status=&include_done=true"),
@@ -825,6 +1050,12 @@ async function refresh() {
       api("/api/tasks/record/state"),
       api("/api/daily-brief"),
       api("/api/capture/diagnostics"),
+      api("/api/capture/bot/status"),
+      api("/api/capture/bot/sessions"),
+      api("/api/calendar/status"),
+      api("/api/calendar/upcoming"),
+      api("/api/notifications/status"),
+      api("/api/notifications/candidates"),
     ]);
     state.meetings = meetings.meetings;
     state.tasks = tasks.tasks;
@@ -836,6 +1067,9 @@ async function refresh() {
     $("record-state").textContent = JSON.stringify(captureStatus, null, 2);
     $("task-record-state").textContent = JSON.stringify(taskRecordState, null, 2);
     $("capture-diagnostics").textContent = JSON.stringify(captureDiagnostics, null, 2);
+    renderBotStatus(botStatus, botSessions.sessions || []);
+    renderCalendar(calendarStatus, calendarUpcoming.events || [], dailyBrief);
+    renderNotifications(notificationStatus, notificationCandidates.candidates || []);
     setStatus("Ready");
   } catch (error) {
     setStatus(error.message);
@@ -851,15 +1085,25 @@ function renderDailyBrief(brief) {
     ["Uncertain", brief.uncertain || []],
     ["Stale", brief.stale || []],
     ["Recommended follow-ups", brief.recommended_followups || []],
+    ["Calendar today", brief.calendar_today || []],
+    ["Upcoming meetings", brief.calendar_upcoming || []],
+    ["Meeting prep", brief.meeting_prep || []],
   ];
   target.innerHTML = "";
   cards.forEach(([label, items]) => {
     const node = document.createElement("div");
     node.className = "brief-card";
-    const preview = items.slice(0, 3).map((task) => `<div class="meta">[${task.id}] ${escapeHtml(task.text)}</div>`).join("");
+    const preview = items.slice(0, 3).map((item) => `<div class="meta">${escapeHtml(briefItemLabel(item))}</div>`).join("");
     node.innerHTML = `<strong>${label}: ${items.length}</strong>${preview || '<div class="meta">Nothing here.</div>'}`;
     target.appendChild(node);
   });
+}
+
+function briefItemLabel(item) {
+  if (item.event) return `${item.event.start_at || ""} ${item.event.title || "Untitled event"}`;
+  if (item.title && item.start_at) return `${item.start_at} ${item.title}`;
+  if (item.text) return `[${item.id}] ${item.text}`;
+  return JSON.stringify(item);
 }
 
 function renderMeetings() {
@@ -1004,6 +1248,101 @@ function renderSettings(settings) {
   });
 }
 
+function renderBotStatus(status, sessions) {
+  $("bot-status").textContent = JSON.stringify({
+    provider: status.provider,
+    status: status.status,
+    enabled: status.enabled,
+    note: status.note,
+    cloud_cost_label: status.cloud_cost_label,
+  }, null, 2);
+  const target = $("bot-sessions");
+  target.innerHTML = "";
+  if (!sessions.length) {
+    target.innerHTML = '<div class="meta">No bot sessions yet.</div>';
+    return;
+  }
+  sessions.forEach((session) => {
+    const item = document.createElement("div");
+    item.className = "item";
+    const transcriptLabel = session.transcript_ready
+      ? "transcript ready"
+      : session.status === "transcript_requested"
+        ? "transcript requested; sync again after Recall finishes"
+        : session.status && session.status.startsWith("transcript_processing")
+          ? "transcript processing; sync again in a few minutes"
+          : "waiting for transcript";
+    item.innerHTML = `
+      <strong>${escapeHtml(session.title || session.meeting_title)}</strong>
+      <div class="meta">session ${session.id} · meeting ${session.meeting_id} · ${escapeHtml(session.status)} · ${escapeHtml(transcriptLabel)}</div>
+      <div class="meta">${escapeHtml(session.meeting_url_display || "")}</div>
+      <div class="task-actions">
+        <button data-action="sync">Sync</button>
+        <button data-action="process">Process</button>
+        ${session.meeting_id ? `<button data-action="meeting">Open Meeting</button>` : ""}
+      </div>
+    `;
+    item.querySelector('[data-action="sync"]').onclick = () => syncBotSession(session.id);
+    const processButton = item.querySelector('[data-action="process"]');
+    processButton.disabled = !session.transcript_ready && !session.meeting_transcript_path;
+    processButton.onclick = () => processBotSession(session.id);
+    const meeting = item.querySelector('[data-action="meeting"]');
+    if (meeting) meeting.onclick = () => loadMeeting(session.meeting_id);
+    target.appendChild(item);
+  });
+}
+
+function renderCalendar(status, events, brief) {
+  $("calendar-status").textContent = JSON.stringify(status, null, 2);
+  const target = $("calendar-upcoming");
+  target.innerHTML = "";
+  if (!events.length) {
+    target.innerHTML = '<div class="meta">No synced upcoming events.</div>';
+  } else {
+    events.forEach((event) => target.appendChild(calendarEventNode(event)));
+  }
+}
+
+function calendarEventNode(event) {
+  const item = document.createElement("div");
+  item.className = "item";
+  item.innerHTML = `
+    <strong>${escapeHtml(event.title || "Untitled event")}</strong>
+    <div class="meta">${escapeHtml(event.start_at || "")} → ${escapeHtml(event.end_at || "")}</div>
+    ${event.meeting_url ? `<div class="meta">${escapeHtml(event.meeting_url)}</div>` : ""}
+    ${event.location ? `<div class="meta">${escapeHtml(event.location)}</div>` : ""}
+  `;
+  return item;
+}
+
+function renderNotifications(status, candidates) {
+  $("notifications-status").textContent = JSON.stringify(status, null, 2);
+  const target = $("notifications-candidates");
+  target.innerHTML = "";
+  if (!candidates.length) {
+    target.innerHTML = '<div class="meta">No notification candidates right now.</div>';
+    return;
+  }
+  candidates.forEach((candidate) => {
+    const item = document.createElement("div");
+    item.className = "item";
+    item.innerHTML = `
+      <strong>#${candidate.id} ${escapeHtml(candidate.title)}</strong>
+      <div class="meta">${escapeHtml(candidate.notification_reason || candidate.reason || "")}</div>
+      <div class="meta">${escapeHtml(candidate.notification_status || "candidate")}</div>
+      <div class="task-actions">
+        <button data-action="delivered">Mark Delivered</button>
+        <button data-action="snooze">Snooze</button>
+        <button data-action="dismiss">Dismiss</button>
+      </div>
+    `;
+    item.querySelector('[data-action="delivered"]').onclick = () => markNotificationDelivered(candidate.id);
+    item.querySelector('[data-action="snooze"]').onclick = () => snoozeNotification(candidate.id);
+    item.querySelector('[data-action="dismiss"]').onclick = () => dismissNotification(candidate.id);
+    target.appendChild(item);
+  });
+}
+
 async function loadMeeting(id) {
   try {
     const data = await api(`/api/meetings/${id}`);
@@ -1055,6 +1394,39 @@ async function stopAndProcessRecording() {
   await loadMeeting(data.meeting_id);
 }
 
+async function joinBotSession() {
+  const title = $("bot-title").value.trim();
+  const meetingUrl = $("bot-url").value.trim();
+  if (!title) return setStatus("Bot meeting title is required");
+  if (!meetingUrl) return setStatus("Meeting link is required");
+  if (!$("bot-consent").checked) return setStatus("Confirm consent/disclosure before sending a meeting bot.");
+  const data = await api("/api/capture/bot/join", {
+    method: "POST",
+    body: JSON.stringify({
+      title,
+      meeting_url: meetingUrl,
+      consent_confirmed: true,
+    }),
+  });
+  setStatus(`Joined bot session ${data.session.id}`);
+  $("bot-url").value = "";
+  $("bot-consent").checked = false;
+  refresh();
+}
+
+async function syncBotSession(id) {
+  const data = await api(`/api/capture/bot/sessions/${id}/sync`, { method: "POST", body: "{}" });
+  setStatus(data.transcript_path ? `Bot transcript ready for session ${id}` : `Synced bot session ${id}`);
+  refresh();
+}
+
+async function processBotSession(id) {
+  const data = await api(`/api/capture/bot/sessions/${id}/process`, { method: "POST", body: "{}" });
+  setStatus(`Processed bot meeting ${data.meeting.id}`);
+  await refresh();
+  await loadMeeting(data.meeting.id);
+}
+
 async function processMeeting() {
   if (!state.selectedMeetingId) return setStatus("Select a meeting first");
   setStatus("Processing meeting...");
@@ -1072,7 +1444,7 @@ async function runAssistantCommand() {
   });
   $("assistant-output").textContent = renderAssistantResult(data);
   setStatus(data.summary);
-  if (["add_task", "complete_task", "reopen_task"].includes(data.action)) {
+  if (["add_task", "complete_task", "reopen_task", "confirm_suggestion", "dismiss_suggestion", "snooze_suggestion"].includes(data.action)) {
     refresh();
   }
 }
@@ -1087,6 +1459,24 @@ function renderAssistantResult(data) {
     result.capabilities.forEach((capability) => {
       lines.push(`[${capability.category}] ${capability.command} - ${capability.description}`);
     });
+  } else if (result.contexts) {
+    if (result.contexts.length) {
+      lines.push("", "Contexts");
+      result.contexts.forEach((context) => lines.push(`[${context.id}] ${context.name} (${context.kind})`));
+    }
+    if (result.tasks && result.tasks.length) {
+      lines.push("", "Tasks");
+      result.tasks.forEach((task) => {
+        const due = task.due_date ? ` due ${task.due_date}` : "";
+        lines.push(`[${task.id}] ${task.text}${due}`);
+      });
+    }
+    if (result.suggestions && result.suggestions.length) {
+      lines.push("", "Suggestions");
+      result.suggestions.slice(0, 8).forEach((suggestion) => {
+        lines.push(`[${suggestion.id}] ${suggestion.title} (${suggestion.status})`);
+      });
+    }
   } else if (result.tasks) {
     if (!result.tasks.length) return lines.join("\\n");
     lines.push("");
@@ -1103,12 +1493,27 @@ function renderAssistantResult(data) {
       if (!meeting.note_path) flags.push("no note");
       lines.push(`[${meeting.id}] ${meeting.title}${flags.length ? " (" + flags.join(", ") + ")" : ""}`);
     });
+  } else if (result.sessions) {
+    if (!result.sessions.length) return lines.join("\\n");
+    lines.push("");
+    result.sessions.forEach((session) => {
+      lines.push(`[${session.id}] ${session.title || session.meeting_title} · ${session.status} · meeting ${session.meeting_id}`);
+    });
   } else if (result.task) {
     const task = result.task;
     const due = task.due_date ? ` due ${task.due_date}` : "";
     lines.push("", `[${task.id}] ${task.text}${due} (${task.status})`);
   } else if (result.draft) {
     lines.push("", `Subject: ${result.draft.subject}`, "", result.draft.body || "");
+  } else if (result.suggestions) {
+    if (!result.suggestions.length) return lines.join("\\n");
+    lines.push("");
+    result.suggestions.forEach((suggestion) => {
+      const context = suggestion.context && suggestion.context.name ? ` · ${suggestion.context.name}` : "";
+      lines.push(`[${suggestion.id}] ${suggestion.title}${context} (${suggestion.status})`);
+    });
+  } else if (result.suggestion) {
+    lines.push("", `[${result.suggestion.id}] ${result.suggestion.title} (${result.suggestion.status})`);
   } else if (result.meeting) {
     lines.push("", `[${result.meeting.id}] ${result.meeting.title}`);
     if (result.note_path) lines.push(`Note: ${result.note_path}`);
@@ -1220,6 +1625,35 @@ async function searchContext() {
   $("context-output").textContent = data.markdown;
 }
 
+async function syncCalendar() {
+  setStatus("Syncing Google Calendar...");
+  const data = await api("/api/calendar/sync", { method: "POST", body: "{}" });
+  setStatus(`Synced ${data.synced_count} calendar events`);
+  refresh();
+}
+
+async function markNotificationDelivered(id) {
+  await api(`/api/notifications/${id}/mark-delivered`, { method: "POST", body: "{}" });
+  setStatus(`Marked notification ${id} delivered`);
+  refresh();
+}
+
+async function snoozeNotification(id) {
+  const until = prompt("Snooze until YYYY-MM-DD", "");
+  await api(`/api/notifications/${id}/snooze`, {
+    method: "POST",
+    body: JSON.stringify({ until }),
+  });
+  setStatus(`Snoozed notification ${id}`);
+  refresh();
+}
+
+async function dismissNotification(id) {
+  await api(`/api/notifications/${id}/dismiss`, { method: "POST", body: "{}" });
+  setStatus(`Dismissed notification ${id}`);
+  refresh();
+}
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -1235,6 +1669,11 @@ $("refresh").onclick = refresh;
 $("record-start").onclick = () => startRecording().catch((error) => setStatus(error.message));
 $("record-stop").onclick = () => stopRecording().catch((error) => setStatus(error.message));
 $("record-stop-process").onclick = () => stopAndProcessRecording().catch((error) => setStatus(error.message));
+$("bot-join").onclick = () => joinBotSession().catch((error) => setStatus(error.message));
+$("bot-refresh").onclick = () => refresh().catch((error) => setStatus(error.message));
+$("calendar-sync").onclick = () => syncCalendar().catch((error) => setStatus(error.message));
+$("calendar-refresh").onclick = () => refresh().catch((error) => setStatus(error.message));
+$("notifications-refresh").onclick = () => refresh().catch((error) => setStatus(error.message));
 $("assistant-run").onclick = () => runAssistantCommand().catch((error) => setStatus(error.message));
 $("assistant-command").addEventListener("keydown", (event) => {
   if (event.key === "Enter") runAssistantCommand().catch((error) => setStatus(error.message));

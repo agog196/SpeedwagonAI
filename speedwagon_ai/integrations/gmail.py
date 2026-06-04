@@ -5,6 +5,7 @@ from email.message import EmailMessage
 
 from speedwagon_ai.config import Settings
 from speedwagon_ai.email_composer import EmailComposer, EmailDraftContent
+from speedwagon_ai.integrations.calendar import GMAIL_SCOPES
 from speedwagon_ai.storage import Repository
 
 
@@ -39,7 +40,7 @@ def create_gmail_draft(
             "google-api-python-client google-auth-httplib2 google-auth-oauthlib"
         ) from exc
 
-    scopes = ["https://www.googleapis.com/auth/gmail.compose"]
+    scopes = GMAIL_SCOPES
     creds = None
     if settings.gmail_token_path.exists():
         creds = Credentials.from_authorized_user_file(str(settings.gmail_token_path), scopes)

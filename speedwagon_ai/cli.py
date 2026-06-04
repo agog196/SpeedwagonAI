@@ -13,7 +13,9 @@ from speedwagon_ai.app import run_app
 from speedwagon_ai.config import Settings
 from speedwagon_ai.context import render_context
 from speedwagon_ai.extraction import Extractor
+from speedwagon_ai.integrations.calendar import GoogleCalendarService
 from speedwagon_ai.integrations.gmail import create_gmail_draft, preview_followup_email
+from speedwagon_ai.meeting_bot import MeetingBotService
 from speedwagon_ai.output import MarkdownWriter
 from speedwagon_ai.processing import process_meeting
 from speedwagon_ai.storage import Repository
@@ -73,6 +75,51 @@ def build_parser() -> argparse.ArgumentParser:
     capture_doctor = capture_sub.add_parser("doctor", help="Show capture diagnostics and optionally smoke-test audio input.")
     capture_doctor.add_argument("--smoke-test", action="store_true", help="Record one second to a temporary WAV file.")
     capture_doctor.set_defaults(func=cmd_capture_doctor)
+
+    bot_parser = subparsers.add_parser("bot", help="Managed meeting bot beta.")
+    bot_sub = bot_parser.add_subparsers(dest="bot_command", required=True)
+    bot_status = bot_sub.add_parser("status", help="Show meeting bot provider status.")
+    bot_status.set_defaults(func=cmd_bot_status)
+    bot_join = bot_sub.add_parser("join", help="Send the configured bot to a meeting link.")
+    bot_join.add_argument("--url", required=True, help="Zoom, Google Meet, Teams, or other supported meeting URL.")
+    bot_join.add_argument("--title", required=True)
+    bot_join.add_argument("--join-at")
+    bot_join.add_argument("--bot-name")
+    bot_join.add_argument("--confirm-consent", action="store_true", help="Confirm participants are allowed/aware of bot capture.")
+    bot_join.set_defaults(func=cmd_bot_join)
+    bot_sessions = bot_sub.add_parser("sessions", help="List local bot sessions.")
+    bot_sessions.set_defaults(func=cmd_bot_sessions)
+    bot_sync = bot_sub.add_parser("sync", help="Pull transcript/status for a bot session.")
+    bot_sync.add_argument("session_id", type=int)
+    bot_sync.set_defaults(func=cmd_bot_sync)
+    bot_process = bot_sub.add_parser("process", help="Process a bot transcript into notes/tasks.")
+    bot_process.add_argument("session_id", type=int)
+    bot_process.set_defaults(func=cmd_bot_process)
+
+    calendar_parser = subparsers.add_parser("calendar", help="Google Calendar read-only integration.")
+    calendar_sub = calendar_parser.add_subparsers(dest="calendar_command", required=True)
+    calendar_status = calendar_sub.add_parser("status", help="Show Google Calendar sync status.")
+    calendar_status.set_defaults(func=cmd_calendar_status)
+    calendar_sync = calendar_sub.add_parser("sync", help="Sync the configured rolling Calendar window.")
+    calendar_sync.set_defaults(func=cmd_calendar_sync)
+    calendar_upcoming = calendar_sub.add_parser("upcoming", help="List upcoming synced Calendar events.")
+    calendar_upcoming.add_argument("--limit", type=int, default=10)
+    calendar_upcoming.set_defaults(func=cmd_calendar_upcoming)
+
+    notifications_parser = subparsers.add_parser("notifications", help="Native notification candidate tools.")
+    notifications_sub = notifications_parser.add_subparsers(dest="notifications_command", required=True)
+    notifications_status = notifications_sub.add_parser("status", help="Show local notification candidate status.")
+    notifications_status.set_defaults(func=cmd_notifications_status)
+    notifications_candidates = notifications_sub.add_parser("candidates", help="List notification-ready suggestions.")
+    notifications_candidates.add_argument("--limit", type=int, default=20)
+    notifications_candidates.set_defaults(func=cmd_notifications_candidates)
+    notifications_snooze = notifications_sub.add_parser("snooze", help="Snooze a notification candidate.")
+    notifications_snooze.add_argument("suggestion_id", type=int)
+    notifications_snooze.add_argument("--until")
+    notifications_snooze.set_defaults(func=cmd_notifications_snooze)
+    notifications_dismiss = notifications_sub.add_parser("dismiss", help="Dismiss a notification candidate.")
+    notifications_dismiss.add_argument("suggestion_id", type=int)
+    notifications_dismiss.set_defaults(func=cmd_notifications_dismiss)
 
     transcribe_parser = subparsers.add_parser("transcribe", help="Transcribe a meeting with whisper.cpp.")
     transcribe_parser.add_argument("meeting_id", type=int)
@@ -197,10 +244,16 @@ def cmd_ask(args: argparse.Namespace, settings: Settings, repo: Repository) -> i
     result = response.get("result") or {}
     if "capabilities" in result:
         print_capabilities(result["capabilities"])
+    elif "contexts" in result:
+        print_context_graph(result)
     elif "tasks" in result:
         print_tasks(result["tasks"])
+    elif "suggestions" in result:
+        print_suggestions(result["suggestions"])
     elif "meetings" in result:
         print_meetings(result["meetings"])
+    elif "sessions" in result:
+        print_bot_sessions(result["sessions"])
     elif "task" in result:
         print_tasks([result["task"]])
         MarkdownWriter(settings, repo).write_commitments()
@@ -285,6 +338,117 @@ def cmd_capture_doctor(args: argparse.Namespace, settings: Settings, repo: Repos
             print("Smoke test failed. On macOS, check microphone permission for Terminal/VS Code and set SPEEDWAGON_INPUT_DEVICE to your Sound Input device name.")
             return 1
         print(f"Smoke test wrote {path.stat().st_size} bytes.")
+    return 0
+
+
+def cmd_bot_status(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    status = MeetingBotService(settings, repo).status()
+    print(f"Provider: {status.get('provider')}")
+    print(f"Status: {status.get('status')}")
+    print(f"Enabled: {status.get('enabled')}")
+    print(f"Bot name: {status.get('bot_name') or status.get('default_bot_name')}")
+    print(f"Note: {status.get('note')}")
+    return 0
+
+
+def cmd_bot_join(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = MeetingBotService(settings, repo).join(
+        meeting_url=args.url,
+        title=args.title,
+        join_at=args.join_at,
+        bot_name=args.bot_name,
+        consent_confirmed=args.confirm_consent,
+    )
+    session = result["session"]
+    print(f"Joined bot session {session['id']} for meeting {session['meeting_id']}")
+    print(f"Provider bot id: {session.get('provider_bot_id')}")
+    print(f"Status: {session.get('status')}")
+    print(f"Meeting URL: {session.get('meeting_url_display')}")
+    return 0
+
+
+def cmd_bot_sessions(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    print_bot_sessions(MeetingBotService(settings, repo).sessions())
+    return 0
+
+
+def cmd_bot_sync(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = MeetingBotService(settings, repo).sync(args.session_id)
+    session = result["session"]
+    print(f"Synced bot session {session['id']}: {session['status']}")
+    if result.get("transcript_path"):
+        print(f"Transcript: {result['transcript_path']}")
+    return 0
+
+
+def cmd_bot_process(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = MeetingBotService(settings, repo).process(args.session_id)
+    print(f"Processed bot meeting {result['meeting']['id']}: {result['meeting']['title']}")
+    print(f"Wrote transcript: {result['transcript_path']}")
+    print(f"Wrote note: {result['note_path']}")
+    print(f"Wrote commitments: {result['commitments_path']}")
+    return 0
+
+
+def cmd_calendar_status(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    status = GoogleCalendarService(settings, repo).status()
+    print(f"Google Calendar: {status['status']}")
+    print(status["note"])
+    print(f"Calendars: {', '.join(status['calendar_ids'])}")
+    print(f"Window: {status['sync_days_back']} days back / {status['sync_days_forward']} days forward")
+    return 0
+
+
+def cmd_calendar_sync(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = GoogleCalendarService(settings, repo).sync()
+    print(f"Synced {result['synced_count']} calendar events.")
+    print(f"Window: {result['time_min']} to {result['time_max']}")
+    return 0
+
+
+def cmd_calendar_upcoming(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    events = GoogleCalendarService(settings, repo).upcoming(limit=args.limit)["events"]
+    print_calendar_events(events)
+    return 0
+
+
+def cmd_notifications_status(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    status = repo.notification_status()
+    print(f"Notifications: {status['delivery']} ({status['runtime']})")
+    print(status["note"])
+    print(f"Candidates: {status['candidate_count']}")
+    print(f"Delivered: {status['delivered_count']} · Snoozed: {status['snoozed_count']} · Dismissed: {status['dismissed_count']}")
+    return 0
+
+
+def cmd_notifications_candidates(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    print_suggestions(repo.notification_candidates(limit=args.limit))
+    return 0
+
+
+def cmd_notifications_snooze(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = repo.snooze_notification(args.suggestion_id, args.until)
+    suggestion = result["suggestion"]
+    print(f"Snoozed notification {suggestion['id']}: {suggestion['title']}")
+    return 0
+
+
+def cmd_notifications_dismiss(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = repo.dismiss_notification(args.suggestion_id)
+    suggestion = result["suggestion"]
+    print(f"Dismissed notification {suggestion['id']}: {suggestion['title']}")
     return 0
 
 
@@ -486,6 +650,59 @@ def print_meetings(meetings: list[dict]) -> None:
             markers.append("no note")
         suffix = f" ({', '.join(markers)})" if markers else ""
         print(f"- [{meeting['id']}] {meeting['title']} {meeting.get('started_at', '')[:10]}{suffix}")
+
+
+def print_suggestions(suggestions: list[dict]) -> None:
+    if not suggestions:
+        print("No suggestions.")
+        return
+    for suggestion in suggestions:
+        context = suggestion.get("context") or {}
+        context_label = f" [{context.get('name')}]" if context.get("name") else ""
+        print(f"- [{suggestion['id']}] {suggestion['title']}{context_label} ({suggestion['status']})")
+        print(f"  {suggestion['reason']}")
+        if suggestion.get("notification_reason"):
+            print(f"  notify: {suggestion['notification_reason']} ({suggestion.get('notification_status') or 'candidate'})")
+
+
+def print_bot_sessions(sessions: list[dict]) -> None:
+    if not sessions:
+        print("No bot sessions.")
+        return
+    for session in sessions:
+        ready = "transcript ready" if session.get("transcript_ready") else "no transcript yet"
+        print(
+            f"- [{session['id']}] {session.get('title') or session.get('meeting_title')} "
+            f"meeting {session.get('meeting_id')} · {session.get('status')} · {ready}"
+        )
+        print(f"  {session.get('meeting_url_display') or '(no URL display)'}")
+
+
+def print_calendar_events(events: list[dict]) -> None:
+    if not events:
+        print("No calendar events.")
+        return
+    for event in events:
+        meeting = f" · {event['meeting_url']}" if event.get("meeting_url") else ""
+        print(f"- [{event['id']}] {event['start_at']} {event['title']}{meeting}")
+        if event.get("location"):
+            print(f"  {event['location']}")
+
+
+def print_context_graph(graph: dict) -> None:
+    contexts = graph.get("contexts") or []
+    if contexts:
+        print("Contexts")
+        for context in contexts:
+            print(f"- [{context['id']}] {context['name']} ({context['kind']})")
+    print("\nTasks")
+    print_tasks(graph.get("tasks") or [])
+    if graph.get("meetings"):
+        print("\nMeetings")
+        print_meetings(graph["meetings"])
+    if graph.get("suggestions"):
+        print("\nSuggestions")
+        print_suggestions(graph["suggestions"])
 
 
 def print_draft(draft: dict) -> None:

@@ -117,6 +117,7 @@ def make_settings(root: Path) -> Settings:
         anthropic_api_key="",
         gmail_credentials_path=root / "data" / "google_credentials.json",
         gmail_token_path=root / "data" / "google_token.json",
+        google_calendar_token_path=root / "data" / "google_calendar_token.json",
     )
 
 

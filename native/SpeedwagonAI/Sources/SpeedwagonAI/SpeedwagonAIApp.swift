@@ -1,10 +1,12 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
+import UserNotifications
 
 @main
 struct SpeedwagonAIApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var state = AppState()
+    @StateObject private var state = AppState.shared
 
     var body: some Scene {
         WindowGroup("SpeedwagonAI", id: "main") {
@@ -12,12 +14,6 @@ struct SpeedwagonAIApp: App {
                 .environmentObject(state)
         }
         .defaultSize(width: 1160, height: 760)
-
-        Window("Command Palette", id: "commandPalette") {
-            CommandPaletteView()
-                .environmentObject(state)
-        }
-        .defaultSize(width: 680, height: 460)
 
         MenuBarExtra {
             MenuBarContent()
@@ -52,10 +48,7 @@ struct MenuBarContent: View {
             }
 
             Button("Open Command Palette") {
-                openWindow(id: "commandPalette")
-                DispatchQueue.main.async {
-                    activateSpeedwagon()
-                }
+                AssistantPanelController.shared.toggle(state: state)
             }
             .keyboardShortcut("k", modifiers: .command)
 
@@ -77,8 +70,24 @@ struct MenuBarContent: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var hotKey: GlobalHotKey?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if supportsNativeNotifications() {
+            UNUserNotificationCenter.current().delegate = self
+            AppState.shared.startNotificationPollingIfNeeded()
+        } else {
+            Task { @MainActor in
+                AppState.shared.notificationPermissionStatus = "unsupported"
+                AppState.shared.statusMessage = "Native notifications require an app bundle; swift run disables them."
+            }
+        }
         NSApplication.shared.setActivationPolicy(.regular)
+        hotKey = GlobalHotKey(keyCode: kVK_Space, modifiers: optionKey) {
+            Task { @MainActor in
+                AssistantPanelController.shared.toggle(state: AppState.shared)
+            }
+        }
         DispatchQueue.main.async {
             activateSpeedwagon()
         }
@@ -87,6 +96,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         activateSpeedwagon()
         return true
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        await MainActor.run {
+            activateSpeedwagon()
+            Task {
+                await AppState.shared.refreshAll(updateStatus: false)
+            }
+        }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 }
 

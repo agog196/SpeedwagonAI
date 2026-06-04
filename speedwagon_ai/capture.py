@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -11,12 +12,15 @@ from pathlib import Path
 from typing import Any
 
 from speedwagon_ai.config import Settings
+from speedwagon_ai.dateparse import parse_date_phrase
 from speedwagon_ai.storage import Repository
 from speedwagon_ai.timeutil import utc_now_iso
 from speedwagon_ai.transcription import transcribe_audio
 
 
 CAPTURE_KINDS = {"meeting", "task_note", "assistant_voice"}
+NATIVE_CAPTURE_KINDS = {"meeting"}
+NATIVE_CAPTURE_MODES = {"system_mic", "system_only"}
 MIN_RECORDING_BYTES = 4096
 
 
@@ -57,6 +61,8 @@ class CaptureService:
         self.settings.ensure_dirs()
         if self.status()["active"]:
             raise RuntimeError("A recording is already in progress. Stop it before starting another capture.")
+        if native_capture_active(self.settings):
+            raise RuntimeError("A native capture session is already in progress. Stop it before starting another capture.")
 
         if kind == "meeting":
             clean_title = title.strip()
@@ -222,10 +228,12 @@ class CaptureService:
         text = clean_task_transcript(transcript_path.read_text(encoding="utf-8"))
         if not text:
             raise RuntimeError("Task recording transcribed as empty. Check microphone input and try again.")
+        parsed_task = parse_voice_task_text(text)
+        due_date = optional_text(task_metadata.get("due_date") or task_metadata.get("due")) or parsed_task.get("due_date")
         task = self.repo.create_task(
-            text,
+            parsed_task["text"],
             owner=optional_text(task_metadata.get("owner")),
-            due_date=optional_text(task_metadata.get("due_date") or task_metadata.get("due")),
+            due_date=due_date,
             owed_to=optional_text(task_metadata.get("owed_to")),
             project=optional_text(task_metadata.get("project")),
             source="voice_task",
@@ -238,6 +246,7 @@ class CaptureService:
             "audio_path": str(audio_path),
             "transcript_path": str(transcript_path),
             "transcript": text,
+            "parsed_text": parsed_task["text"],
         }
 
     def _finish_assistant_voice(self, session: dict[str, Any]) -> dict[str, Any]:
@@ -253,6 +262,143 @@ class CaptureService:
             "transcript_path": str(transcript_path),
             "transcript": transcript,
         }
+
+
+class NativeCaptureService:
+    """Backend-side handoff state for Swift-owned ScreenCaptureKit recording."""
+
+    def __init__(self, settings: Settings, repo: Repository):
+        self.settings = settings
+        self.repo = repo
+
+    @property
+    def state_path(self) -> Path:
+        return self.settings.state_path.with_name("native-capture.json")
+
+    def prepare(self, kind: str, title: str, mode: str = "system_mic") -> dict[str, Any]:
+        kind = normalize_native_capture_kind(kind)
+        mode = normalize_native_capture_mode(mode)
+        clean_title = title.strip()
+        if not clean_title:
+            raise RuntimeError("Meeting title is required.")
+        if CaptureService(self.settings, self.repo).status().get("active"):
+            raise RuntimeError("A local recorder session is already in progress. Stop it before starting native capture.")
+        active = self.active_session()
+        if active:
+            raise RuntimeError("A native capture session is already in progress. Stop it before starting another one.")
+
+        self.settings.ensure_dirs()
+        audio_dir = self.settings.audio_dir.resolve()
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        meeting = self.repo.create_meeting(clean_title)
+        final_path = audio_dir / f"meeting-{meeting.id}.wav"
+        system_path = audio_dir / f"meeting-{meeting.id}-system.wav"
+        mic_path = audio_dir / f"meeting-{meeting.id}-mic.wav"
+        log_path = self.settings.state_path.parent.resolve() / f"native-capture-meeting-{meeting.id}.log"
+        session = enrich_session(
+            {
+                "active": True,
+                "native": True,
+                "status": "recording",
+                "session_id": f"native-meeting-{meeting.id}",
+                "kind": kind,
+                "mode": mode,
+                "meeting_id": meeting.id,
+                "title": clean_title,
+                "audio_path": str(final_path),
+                "system_audio_path": str(system_path),
+                "microphone_audio_path": str(mic_path),
+                "log_path": str(log_path),
+                "command": ["ScreenCaptureKit", "system_audio", "microphone"],
+                "capture_profile": "native_screencapturekit",
+                "input_device": "system_default",
+                "started_at": meeting.started_at,
+                "warnings": [],
+                "last_error": None,
+            }
+        )
+        self.repo.update_meeting(meeting.id, audio_path=str(final_path))
+        self._write(session)
+        return session
+
+    def complete(
+        self,
+        session_id: str,
+        audio_path: str,
+        process: bool = False,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        session = self.active_session()
+        if not session:
+            raise RuntimeError("No native capture session is in progress.")
+        if str(session.get("session_id")) != session_id:
+            raise RuntimeError("Native capture session id does not match the active session.")
+
+        final_path = Path(audio_path or session.get("audio_path") or "")
+        expected_path = Path(str(session.get("audio_path") or ""))
+        if final_path.resolve() != expected_path.resolve():
+            raise RuntimeError("Native capture completed with an unexpected audio path.")
+        validate_recording_file(final_path)
+        completed = enrich_session(
+            {
+                **session,
+                "active": False,
+                "status": "completed",
+                "ended_at": utc_now_iso(),
+                "warnings": warnings or [],
+                "file_size": final_path.stat().st_size,
+                "last_error": None,
+                "process_requested": bool(process),
+            }
+        )
+        self.repo.update_meeting(
+            int(session["meeting_id"]),
+            ended_at=completed["ended_at"],
+            audio_path=str(final_path),
+        )
+        self._write(completed)
+        return completed
+
+    def fail(self, session_id: str, error: str) -> dict[str, Any]:
+        session = self.active_session() or self.last_session()
+        if not session:
+            raise RuntimeError("No native capture session was found.")
+        if str(session.get("session_id")) != session_id:
+            raise RuntimeError("Native capture session id does not match.")
+        failed = enrich_session(
+            {
+                **session,
+                "active": False,
+                "status": "failed",
+                "ended_at": utc_now_iso(),
+                "last_error": error,
+            }
+        )
+        if failed.get("meeting_id"):
+            self.repo.update_meeting(int(failed["meeting_id"]), ended_at=failed["ended_at"])
+        self._write(failed)
+        return failed
+
+    def status(self) -> dict[str, Any]:
+        session = self.last_session()
+        if not session:
+            return {"active": False, "native": True, "status": "idle"}
+        return session
+
+    def active_session(self) -> dict[str, Any] | None:
+        session = self.last_session()
+        if session and session.get("active"):
+            return session
+        return None
+
+    def last_session(self) -> dict[str, Any] | None:
+        if not self.state_path.exists():
+            return None
+        return enrich_session(json.loads(self.state_path.read_text(encoding="utf-8")))
+
+    def _write(self, session: dict[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(session, indent=2), encoding="utf-8")
 
 
 def recorder_command(
@@ -313,6 +459,31 @@ def normalize_capture_kind(kind: str | None) -> str:
     return normalized
 
 
+def normalize_native_capture_kind(kind: str | None) -> str:
+    normalized = (kind or "meeting").strip().lower().replace("-", "_")
+    if normalized not in NATIVE_CAPTURE_KINDS:
+        raise RuntimeError("native capture currently supports kind 'meeting' only")
+    return normalized
+
+
+def normalize_native_capture_mode(mode: str | None) -> str:
+    normalized = (mode or "system_mic").strip().lower().replace("-", "_")
+    if normalized not in NATIVE_CAPTURE_MODES:
+        raise RuntimeError("native capture mode must be 'system_mic' or 'system_only'")
+    return normalized
+
+
+def native_capture_active(settings: Settings) -> bool:
+    path = settings.state_path.with_name("native-capture.json")
+    if not path.exists():
+        return False
+    try:
+        session = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return bool(session.get("active"))
+
+
 def enrich_session(session: dict[str, Any]) -> dict[str, Any]:
     audio_path = Path(session.get("audio_path") or "")
     log_path = Path(session.get("log_path") or "")
@@ -356,6 +527,22 @@ def clean_task_transcript(text: str) -> str:
         if lowered.startswith(prefix):
             return cleaned[len(prefix) :].strip()
     return cleaned.strip()
+
+
+def parse_voice_task_text(text: str) -> dict[str, str | None]:
+    cleaned = text.strip()
+    match = re.search(
+        r"\s+(?:due(?:\s+(?:by|on))?|by|before|on or before)\s+([A-Za-z]+ \d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|today|tomorrow)[\s.!,?]*$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {"text": cleaned, "due_date": None}
+    due_date = parse_date_phrase(match.group(1))
+    if not due_date:
+        return {"text": cleaned, "due_date": None}
+    task_text = cleaned[: match.start()].strip(" .,;:-")
+    return {"text": task_text or cleaned, "due_date": due_date}
 
 
 def clean_assistant_transcript(text: str) -> str:

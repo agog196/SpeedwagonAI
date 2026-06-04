@@ -38,6 +38,14 @@ class Settings:
     anthropic_api_key: str
     gmail_credentials_path: Path
     gmail_token_path: Path
+    google_calendar_token_path: Path
+    bot_provider: str = ""
+    recall_api_key: str = ""
+    recall_region: str = "us-east-1"
+    recall_bot_name: str = "SpeedwagonAI Notetaker"
+    google_calendar_ids: str = "primary"
+    google_calendar_sync_days_back: int = 14
+    google_calendar_sync_days_forward: int = 30
 
     @classmethod
     def load(cls) -> "Settings":
@@ -61,6 +69,16 @@ class Settings:
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
             gmail_credentials_path=Path(os.getenv("GMAIL_CREDENTIALS_PATH", "data/google_credentials.json")),
             gmail_token_path=Path(os.getenv("GMAIL_TOKEN_PATH", "data/google_token.json")),
+            google_calendar_token_path=Path(
+                os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", "data/google_calendar_token.json")
+            ),
+            bot_provider=os.getenv("SPEEDWAGON_BOT_PROVIDER", "").strip().lower(),
+            recall_api_key=os.getenv("RECALL_API_KEY", ""),
+            recall_region=os.getenv("RECALL_REGION", "us-east-1"),
+            recall_bot_name=os.getenv("RECALL_BOT_NAME", "SpeedwagonAI Notetaker"),
+            google_calendar_ids=os.getenv("GOOGLE_CALENDAR_IDS", "primary"),
+            google_calendar_sync_days_back=int(os.getenv("GOOGLE_CALENDAR_SYNC_DAYS_BACK", "14")),
+            google_calendar_sync_days_forward=int(os.getenv("GOOGLE_CALENDAR_SYNC_DAYS_FORWARD", "30")),
         )
 
     def ensure_dirs(self) -> None:

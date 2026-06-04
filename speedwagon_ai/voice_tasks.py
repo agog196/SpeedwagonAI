@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from speedwagon_ai.capture import CaptureService, clean_task_transcript
+from speedwagon_ai.capture import CaptureService, clean_task_transcript, parse_voice_task_text
 from speedwagon_ai.config import Settings
 from speedwagon_ai.storage import Repository
 

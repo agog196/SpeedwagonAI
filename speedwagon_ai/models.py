@@ -14,6 +14,7 @@ class Meeting:
     transcript_path: str | None = None
     note_path: str | None = None
     summary: str | None = None
+    source_type: str | None = None
 
 
 @dataclass(frozen=True)

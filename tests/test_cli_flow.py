@@ -73,6 +73,39 @@ class CliFlowTests(unittest.TestCase):
                     repo.update_meeting(raw.id, transcript_path=str(second_transcript))
                     self.assertEqual(main(["ask", "process latest meeting"]), 0)
                     self.assertIsNotNone(repo.get_meeting(raw.id).note_path)
+
+                    self.assertEqual(main(["calendar", "status"]), 0)
+                    repo.upsert_calendar_event(
+                        {
+                            "provider_event_id": "cli-event",
+                            "calendar_id": "primary",
+                            "title": "CLI Calendar Event",
+                            "start_at": "2026-06-08T10:00:00-07:00",
+                            "end_at": "2026-06-08T10:30:00-07:00",
+                        }
+                    )
+                    self.assertEqual(main(["calendar", "upcoming"]), 0)
+                    with patch(
+                        "speedwagon_ai.cli.GoogleCalendarService.sync",
+                        return_value={
+                            "synced_count": 0,
+                            "time_min": "2026-05-21T00:00:00Z",
+                            "time_max": "2026-07-04T00:00:00Z",
+                        },
+                    ):
+                        self.assertEqual(main(["calendar", "sync"]), 0)
+
+                    notify_task = repo.create_task("CLI notification task", due_date="2026-06-01")
+                    notify_suggestion = next(
+                        item for item in repo.notification_candidates() if notify_task["id"] in item["task_ids"]
+                    )
+                    self.assertEqual(main(["notifications", "status"]), 0)
+                    self.assertEqual(main(["notifications", "candidates"]), 0)
+                    self.assertEqual(
+                        main(["notifications", "snooze", str(notify_suggestion["id"]), "--until", "2026-06-09"]),
+                        0,
+                    )
+                    self.assertEqual(main(["notifications", "dismiss", str(notify_suggestion["id"])]), 0)
                 finally:
                     os.chdir(old_cwd)
 

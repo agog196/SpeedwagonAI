@@ -32,6 +32,7 @@ class ModelRouterTests(unittest.TestCase):
             anthropic_api_key="",
             gmail_credentials_path=root / "google_credentials.json",
             gmail_token_path=root / "google_token.json",
+            google_calendar_token_path=root / "google_calendar_token.json",
         )
 
     def test_routes_routine_and_strong_operations(self) -> None:

@@ -19,6 +19,11 @@ SpeedwagonAI's product wedge is local-first follow-through: capture work context
 - Local APIs for commitments, daily brief, local capture aliases, bot capture status, and integration status.
 - Cost-aware model router with cheap/strong/web operation tiers.
 - General assistant core with categorized deterministic actions for tasks, commitments, meetings, capture, email, context, brief, and status.
+- Developer SwiftUI shell with menu bar icon, global `Option+Space` assistant palette, voice input, screenshot context, and local API-backed task/brief/commitment views.
+- Local follow-through graph with contexts, context links, in-app suggestions, and confirmation-first suggestion actions.
+- Native meeting capture with ScreenCaptureKit system audio plus AVFoundation microphone audio in the developer Swift app.
+- Optional managed meeting bot beta with Recall.ai-style provider adapter, local bot session records, manual transcript sync, and processing into the existing notes/tasks pipeline.
+- Native-app local notifications from source-linked follow-through suggestions while the app is running.
 
 ## Assistant Direction
 
@@ -41,13 +46,23 @@ The long-term assistant shape:
 - V10: Build practical capture UI, investigate ScreenCaptureKit, and keep BlackHole/custom routing as fallback.
 - V11: Reset the native assistant UI, add resilient command handling, and add local voice-to-assistant input.
 - V12: Add LLM fallback command interpretation, screenshot context, stronger model routing, optional web search mode, and user-visible cost controls.
-- V13: Harden Gmail, add Google Calendar context, Apple Reminders, macOS notifications, and Google Docs/Drive export.
-- V14: Add optional managed meeting bot beta for Zoom/Meet/Teams.
-- V15: Package the first deployable beta with onboarding, Keychain secrets, permissions, import/export, logs, privacy policy, terms, and polished follow-through workflows.
+- V13: Add native Spotlight shell, global `Option+Space`, active-display screenshot flow, follow-through graph, context chips, and in-app suggestions.
+- V14: Production local capture with ScreenCaptureKit/system audio, keeping BlackHole/custom routing as fallback.
+- V15: Optional managed meeting bot beta for Zoom/Meet/Teams.
+- V16: Read-only Google Calendar sync, cached upcoming meetings, daily brief Calendar cards, and meeting-prep context.
+- V17: Native notifications and source-linked suggestion lifecycle.
+- V18: Gmail hardening, Drive/Docs export and retrieval, Apple Calendar, and Apple Reminders.
+- V19: Package the first deployable beta with onboarding, Keychain secrets, permissions, import/export, logs, privacy policy, terms, security checklist, and polished follow-through workflows.
 
 ## Capture Strategy
 
 Local capture remains cheapest and most broadly useful because it works for meetings, calls, lectures, videos, and ad hoc audio. Meeting bots should be opt-in because they are more expensive, more visible to other attendees, and require managed infrastructure or provider APIs.
+
+## Suggestion And Notification Direction
+
+Today, suggestions are lightweight follow-through prompts generated from task and context rules, with V17 source lifecycle metadata for local notification candidates. A source edit, completion, cancellation, snooze, or context merge should update or retire related suggestions so the system does not clutter the user with stale follow-ups.
+
+Notification delivery should be based on those source-linked suggestions plus timing rules, not a separate reminder pile. If a notification has already been sent, SpeedwagonAI should preserve that audit trail while still allowing the underlying suggestion to be resolved, snoozed, or superseded.
 
 ## Trust Defaults
 

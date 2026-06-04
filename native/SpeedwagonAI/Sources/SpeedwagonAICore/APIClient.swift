@@ -36,12 +36,42 @@ public final class SpeedwagonAPIClient {
         return response.tasks
     }
 
+    public func fetchMeetings(limit: Int = 30) async throws -> [MeetingItem] {
+        let url = baseURL.appending(path: "/api/meetings")
+            .appending(queryItems: [URLQueryItem(name: "limit", value: String(limit))])
+        let response: MeetingListResponse = try await get(url)
+        return response.meetings
+    }
+
+    public func fetchMeetingDetail(id: Int) async throws -> MeetingDetailResponse {
+        try await get(baseURL.appending(path: "/api/meetings/\(id)"))
+    }
+
+    public func processMeeting(id: Int) async throws -> MeetingProcessResponse {
+        try await post(baseURL.appending(path: "/api/meetings/\(id)/process"), body: EmptyBody())
+    }
+
     public func fetchSettings() async throws -> SettingsResponse {
         try await get(baseURL.appending(path: "/api/settings"))
     }
 
     public func fetchDailyBrief() async throws -> DailyBriefResponse {
         try await get(baseURL.appending(path: "/api/daily-brief"))
+    }
+
+    public func fetchCalendarStatus() async throws -> CalendarStatusResponse {
+        try await get(baseURL.appending(path: "/api/calendar/status"))
+    }
+
+    public func syncCalendar() async throws -> CalendarSyncResponse {
+        try await post(baseURL.appending(path: "/api/calendar/sync"), body: EmptyBody())
+    }
+
+    public func fetchUpcomingCalendarEvents(limit: Int = 10) async throws -> [CalendarEvent] {
+        let url = baseURL.appending(path: "/api/calendar/upcoming")
+            .appending(queryItems: [URLQueryItem(name: "limit", value: String(limit))])
+        let response: CalendarEventListResponse = try await get(url)
+        return response.events
     }
 
     public func fetchCommitments() async throws -> [TaskItem] {
@@ -59,12 +89,58 @@ public final class SpeedwagonAPIClient {
         return response.actions
     }
 
+    public func fetchSuggestions() async throws -> [SuggestionItem] {
+        let response: SuggestionListResponse = try await get(baseURL.appending(path: "/api/suggestions"))
+        return response.suggestions
+    }
+
+    public func fetchNotificationStatus() async throws -> NotificationStatusResponse {
+        try await get(baseURL.appending(path: "/api/notifications/status"))
+    }
+
+    public func fetchNotificationCandidates(limit: Int = 20) async throws -> [SuggestionItem] {
+        let url = baseURL.appending(path: "/api/notifications/candidates")
+            .appending(queryItems: [URLQueryItem(name: "limit", value: String(limit))])
+        let response: NotificationCandidateListResponse = try await get(url)
+        return response.candidates
+    }
+
+    public func searchContextGraph(query: String) async throws -> ContextGraphResponse {
+        let url = baseURL.appending(path: "/api/context-graph")
+            .appending(queryItems: [URLQueryItem(name: "query", value: query)])
+        return try await get(url)
+    }
+
     public func fetchCaptureStatus() async throws -> CaptureSession {
         try await get(baseURL.appending(path: "/api/capture/status"))
     }
 
     public func fetchCaptureDiagnostics() async throws -> CaptureDiagnostics {
         try await get(baseURL.appending(path: "/api/capture/diagnostics"))
+    }
+
+    public func fetchBotStatus() async throws -> BotStatusResponse {
+        try await get(baseURL.appending(path: "/api/capture/bot/status"))
+    }
+
+    public func fetchBotSessions() async throws -> [BotSession] {
+        let response: BotSessionListResponse = try await get(baseURL.appending(path: "/api/capture/bot/sessions"))
+        return response.sessions
+    }
+
+    public func joinBotSession(meetingUrl: String, title: String, consentConfirmed: Bool) async throws -> BotJoinResponse {
+        try await post(
+            baseURL.appending(path: "/api/capture/bot/join"),
+            body: BotJoinRequest(meetingUrl: meetingUrl, title: title, consentConfirmed: consentConfirmed)
+        )
+    }
+
+    public func syncBotSession(id: Int) async throws -> BotSessionEnvelope {
+        try await post(baseURL.appending(path: "/api/capture/bot/sessions/\(id)/sync"), body: EmptyBody())
+    }
+
+    public func processBotSession(id: Int) async throws -> BotProcessResponse {
+        try await post(baseURL.appending(path: "/api/capture/bot/sessions/\(id)/process"), body: EmptyBody())
     }
 
     public func startCapture(kind: String, title: String? = nil) async throws -> CaptureSession {
@@ -76,6 +152,39 @@ public final class SpeedwagonAPIClient {
     public func stopCapture(process: Bool = false, taskMetadata: [String: String]? = nil) async throws -> CaptureStopResponse {
         let url = baseURL.appending(path: "/api/capture/local/stop")
         return try await post(url, body: CaptureStopRequest(process: process, taskMetadata: taskMetadata))
+    }
+
+    public func prepareNativeCapture(title: String, mode: String = "system_mic") async throws -> CaptureSession {
+        let url = baseURL.appending(path: "/api/capture/native/prepare")
+        let response: CaptureStartResponse = try await post(
+            url,
+            body: NativeCapturePrepareRequest(kind: "meeting", title: title, mode: mode)
+        )
+        return response.session
+    }
+
+    public func completeNativeCapture(
+        sessionId: String,
+        audioPath: String,
+        process: Bool = false,
+        warnings: [String] = []
+    ) async throws -> CaptureStopResponse {
+        let url = baseURL.appending(path: "/api/capture/native/complete")
+        return try await post(
+            url,
+            body: NativeCaptureCompleteRequest(
+                sessionId: sessionId,
+                audioPath: audioPath,
+                process: process,
+                warnings: warnings
+            )
+        )
+    }
+
+    public func failNativeCapture(sessionId: String, error: String) async throws -> CaptureSession {
+        let url = baseURL.appending(path: "/api/capture/native/fail")
+        let response: CaptureStartResponse = try await post(url, body: NativeCaptureFailRequest(sessionId: sessionId, error: error))
+        return response.session
     }
 
     public func fetchAssistantVoiceStatus() async throws -> CaptureSession {
@@ -105,6 +214,44 @@ public final class SpeedwagonAPIClient {
     public func cancelPendingAction(id: Int) async throws -> AssistantCommandResponse {
         let url = baseURL.appending(path: "/api/assistant/actions/\(id)/cancel")
         return try await post(url, body: EmptyBody())
+    }
+
+    public func confirmSuggestion(id: Int) async throws -> SuggestionItem {
+        let url = baseURL.appending(path: "/api/suggestions/\(id)/confirm")
+        let response: SuggestionEnvelope = try await post(url, body: EmptyBody())
+        return response.suggestion
+    }
+
+    public func dismissSuggestion(id: Int) async throws -> SuggestionItem {
+        let url = baseURL.appending(path: "/api/suggestions/\(id)/dismiss")
+        let response: SuggestionEnvelope = try await post(url, body: EmptyBody())
+        return response.suggestion
+    }
+
+    public func snoozeSuggestion(id: Int, until: String? = nil) async throws -> SuggestionItem {
+        let url = baseURL.appending(path: "/api/suggestions/\(id)/snooze")
+        let response: SuggestionEnvelope = try await post(url, body: SuggestionSnoozeRequest(until: until))
+        return response.suggestion
+    }
+
+    public func markNotificationDelivered(id: Int) async throws -> NotificationEnvelope {
+        try await post(baseURL.appending(path: "/api/notifications/\(id)/mark-delivered"), body: EmptyBody())
+    }
+
+    public func dismissNotification(id: Int) async throws -> SuggestionItem {
+        let response: SuggestionEnvelope = try await post(
+            baseURL.appending(path: "/api/notifications/\(id)/dismiss"),
+            body: EmptyBody()
+        )
+        return response.suggestion
+    }
+
+    public func snoozeNotification(id: Int, until: String? = nil) async throws -> SuggestionItem {
+        let response: SuggestionEnvelope = try await post(
+            baseURL.appending(path: "/api/notifications/\(id)/snooze"),
+            body: SuggestionSnoozeRequest(until: until)
+        )
+        return response.suggestion
     }
 
     public func analyzeScreenshot(imageBase64: String, instruction: String? = nil) async throws -> ScreenshotAnalysisResponse {
@@ -154,6 +301,10 @@ public final class SpeedwagonAPIClient {
 }
 
 private struct EmptyBody: Encodable {}
+
+private struct SuggestionSnoozeRequest: Encodable {
+    let until: String?
+}
 
 private extension URL {
     func appending(queryItems: [URLQueryItem]) -> URL {

@@ -1,6 +1,6 @@
 # ScreenCaptureKit Spike
 
-SpeedwagonAI V10 keeps the existing Python recorder stack as the production path. ScreenCaptureKit is the likely long-term native path for system audio and optional screen capture in the Mac app.
+SpeedwagonAI V14 adds the first developer ScreenCaptureKit recorder for native meeting audio. The existing Python recorder stack remains the CLI/web path and the native mic fallback.
 
 ## Why This Matters
 
@@ -14,14 +14,15 @@ Mic capture is cheap and simple, but it only records the microphone. BlackHole c
 - Can capture output be streamed or written directly to WAV/PCM files that whisper.cpp can consume?
 - How should Python receive capture output: file path, local socket, or native-owned recording with backend import?
 
-## Expected Architecture
+## V14 Architecture
 
 - SwiftUI app owns ScreenCaptureKit permissions and native capture sessions.
 - Python backend remains the processing/storage layer.
-- Native app writes local audio files into SpeedwagonAI's configured audio directory.
-- Native app calls the existing local API to create/update meetings and process captured files.
+- Native app writes system and microphone temp WAV files into SpeedwagonAI's configured audio directory.
+- Native app mixes available tracks into `meeting-<id>.wav`.
+- Native app calls the local native handoff API to create/update meetings and process captured files.
 - BlackHole/custom recorder remains a fallback for users who prefer routed audio.
 
-## V10 Boundary
+## V14 Boundary
 
-V10 does not ship ScreenCaptureKit as the active recorder. It only clarifies the path and keeps the capture API shaped so a native recorder can replace the Python subprocess later.
+V14 ships ScreenCaptureKit as the default native meeting recorder in the developer Swift app. It does not yet package the app, start the backend automatically, capture selected windows/regions, or replace CLI/web recording.

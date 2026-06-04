@@ -5,6 +5,8 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+import urllib.error
+from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +14,8 @@ from unittest.mock import patch
 from speedwagon_ai.app import make_handler
 from speedwagon_ai.config import Settings
 from speedwagon_ai.models import ExtractionResult, ExtractedItem
+from speedwagon_ai.meeting_bot import FakeMeetingBotProvider
+from speedwagon_ai.screenshot_context import build_analysis_response
 from speedwagon_ai.storage import Repository
 
 
@@ -38,6 +42,7 @@ class AppApiTests(unittest.TestCase):
             anthropic_api_key="",
             gmail_credentials_path=root / "data" / "google_credentials.json",
             gmail_token_path=root / "data" / "google_token.json",
+            google_calendar_token_path=root / "data" / "google_calendar_token.json",
         )
         self.repo = Repository(self.settings.db_path)
         self.repo.init()
@@ -155,6 +160,82 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(stopped["meeting_id"], started["session"]["meeting_id"])
         self.assertEqual(stopped["transcript_path"], str(self.settings.transcripts_dir / "meeting.txt"))
 
+    def test_native_capture_prepare_complete_and_fail_api(self) -> None:
+        prepared = self.post_json(
+            "/api/capture/native/prepare",
+            {"kind": "meeting", "title": "Native Meeting", "mode": "system_mic"},
+        )
+        session = prepared["session"]
+        self.assertTrue(session["active"])
+        self.assertTrue(session["native"])
+        self.assertEqual(session["capture_profile"], "native_screencapturekit")
+        self.assertTrue(session["audio_path"].endswith(f"meeting-{session['meeting_id']}.wav"))
+        self.assertTrue(session["system_audio_path"].endswith(f"meeting-{session['meeting_id']}-system.wav"))
+        self.assertTrue(session["microphone_audio_path"].endswith(f"meeting-{session['meeting_id']}-mic.wav"))
+
+        status = self.get_json("/api/capture/status")
+        self.assertEqual(status["session_id"], session["session_id"])
+
+        final_audio = Path(session["audio_path"])
+        final_audio.write_bytes(b"RIFFWAVE" + b"0" * 5000)
+        completed = self.post_json(
+            "/api/capture/native/complete",
+            {
+                "session_id": session["session_id"],
+                "audio_path": session["audio_path"],
+                "process": False,
+                "warnings": ["mic unavailable, captured system audio only"],
+            },
+        )
+        self.assertFalse(completed["session"]["active"])
+        self.assertEqual(completed["meeting_id"], session["meeting_id"])
+        self.assertEqual(completed["session"]["warnings"], ["mic unavailable, captured system audio only"])
+        meeting = self.repo.get_meeting(session["meeting_id"])
+        self.assertEqual(meeting.audio_path, session["audio_path"])
+        self.assertIsNotNone(meeting.ended_at)
+
+        failed_prepare = self.post_json(
+            "/api/capture/native/prepare",
+            {"kind": "meeting", "title": "Native Failure", "mode": "system_mic"},
+        )
+        failed = self.post_json(
+            "/api/capture/native/fail",
+            {"session_id": failed_prepare["session"]["session_id"], "error": "permission denied"},
+        )
+        self.assertFalse(failed["session"]["active"])
+        self.assertEqual(failed["session"]["status"], "failed")
+        self.assertEqual(failed["session"]["last_error"], "permission denied")
+
+    def test_native_capture_complete_process_calls_existing_pipeline(self) -> None:
+        prepared = self.post_json(
+            "/api/capture/native/prepare",
+            {"kind": "meeting", "title": "Native Process", "mode": "system_mic"},
+        )
+        session = prepared["session"]
+        Path(session["audio_path"]).write_bytes(b"RIFFWAVE" + b"1" * 5000)
+        meeting = self.repo.get_meeting(session["meeting_id"])
+        with patch(
+            "speedwagon_ai.app.process_meeting",
+            return_value={
+                "meeting": meeting,
+                "transcript_path": self.settings.transcripts_dir / "native.txt",
+                "note_path": self.settings.notes_dir / "native.md",
+                "commitments_path": self.settings.notes_dir / "commitments.md",
+            },
+        ) as process:
+            completed = self.post_json(
+                "/api/capture/native/complete",
+                {
+                    "session_id": session["session_id"],
+                    "audio_path": session["audio_path"],
+                    "process": True,
+                    "warnings": [],
+                },
+            )
+
+        process.assert_called_once_with(self.settings, self.repo, session["meeting_id"])
+        self.assertEqual(completed["transcript_path"], str(self.settings.transcripts_dir / "native.txt"))
+
     def test_assistant_voice_start_stop_runs_transcribed_command(self) -> None:
         class FakeProcess:
             pid = 99997
@@ -201,6 +282,29 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(stopped["transcript"], "please handle my life")
         self.assertFalse(stopped["assistant_response"]["supported"])
         self.assertIn("Unsupported command", stopped["assistant_response"]["summary"])
+
+    def test_voice_task_stop_extracts_due_date_from_transcript(self) -> None:
+        class FakeProcess:
+            pid = 99995
+
+            def poll(self) -> None:
+                return None
+
+        def fake_transcribe(settings: Settings, audio_path: Path, output_base: Path) -> Path:
+            transcript_path = settings.transcripts_dir / "voice-task.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text("send app update to Megan by June 8", encoding="utf-8")
+            return transcript_path
+
+        with patch("speedwagon_ai.capture.subprocess.Popen", return_value=FakeProcess()), patch("speedwagon_ai.capture.os.kill"):
+            started = self.post_json("/api/tasks/record/start", {})
+            Path(started["audio_path"]).write_bytes(b"0" * 5000)
+            with patch("speedwagon_ai.capture.transcribe_audio", side_effect=fake_transcribe):
+                stopped = self.post_json("/api/tasks/record/stop", {})
+
+        self.assertEqual(stopped["task"]["text"], "send app update to Megan")
+        self.assertEqual(stopped["task"]["due_date"], date(date.today().year, 6, 8).isoformat())
+        self.assertEqual(stopped["transcript"], "send app update to Megan by June 8")
 
     def test_task_api_create_complete_reopen_and_overdue(self) -> None:
         created = self.post_json(
@@ -249,6 +353,59 @@ class AppApiTests(unittest.TestCase):
         command_capabilities = self.post_json("/api/assistant/command", {"command": "what can you do"})
         self.assertEqual(command_capabilities["action"], "list_capabilities")
         self.assertTrue(command_capabilities["result"]["capabilities"])
+
+    def test_context_graph_and_suggestion_apis(self) -> None:
+        blocker = self.post_json("/api/tasks", {"text": "Finish DairyMGT tabs", "project": "DairyMGT"})
+        email = self.post_json("/api/tasks", {"text": "Email Megan about DairyMGT updates", "project": "DairyMGT"})
+        self.post_json(f"/api/tasks/{blocker['task']['id']}/complete", {})
+
+        graph = self.get_json("/api/context-graph?query=DairyMGT")
+        suggestions = self.get_json("/api/suggestions")
+        suggestion = next(item for item in suggestions["suggestions"] if item["proposed_action"] == "draft_email_from_context")
+
+        self.assertTrue(any(context["name"] == "DairyMGT" for context in graph["contexts"]))
+        self.assertTrue(any(task["id"] == email["task"]["id"] for task in graph["tasks"]))
+        self.assertEqual(suggestion["context"]["name"], "DairyMGT")
+
+        snoozed = self.post_json(f"/api/suggestions/{suggestion['id']}/snooze", {"until": "2026-06-08"})
+        self.assertEqual(snoozed["suggestion"]["status"], "snoozed")
+        self.assertEqual(snoozed["suggestion"]["snoozed_until"], "2026-06-08")
+
+        dismissed = self.post_json(f"/api/suggestions/{suggestion['id']}/dismiss", {})
+        self.assertEqual(dismissed["suggestion"]["status"], "dismissed")
+
+        confirm_me = self.repo.create_suggestion(
+            title="Search related tasks",
+            reason="Related work is visible.",
+            proposed_action="search_tasks",
+            payload={"query": "DairyMGT"},
+        )
+        confirmed = self.post_json(f"/api/suggestions/{confirm_me['id']}/confirm", {})
+        self.assertEqual(confirmed["suggestion"]["status"], "accepted")
+        self.assertTrue(confirmed["action_result"]["tasks"])
+
+    def test_notification_apis(self) -> None:
+        task = self.post_json("/api/tasks", {"text": "Send notification follow-up", "due_date": "2026-06-01"})["task"]
+
+        status = self.get_json("/api/notifications/status")
+        self.assertEqual(status["delivery"], "native_app")
+        self.assertGreaterEqual(status["candidate_count"], 1)
+
+        candidates = self.get_json("/api/notifications/candidates")
+        suggestion = next(item for item in candidates["candidates"] if task["id"] in item["task_ids"])
+        self.assertEqual(suggestion["notification_status"], "candidate")
+        self.assertTrue(suggestion["source_fingerprint"])
+
+        delivered = self.post_json(f"/api/notifications/{suggestion['id']}/mark-delivered", {})
+        self.assertEqual(delivered["suggestion"]["notification_status"], "delivered")
+        self.assertEqual(delivered["notification"]["status"], "delivered")
+
+        snoozed = self.post_json(f"/api/notifications/{suggestion['id']}/snooze", {"until": "2026-06-09"})
+        self.assertEqual(snoozed["suggestion"]["notification_status"], "snoozed")
+        self.assertEqual(snoozed["suggestion"]["next_notify_at"], "2026-06-09")
+
+        dismissed = self.post_json(f"/api/notifications/{suggestion['id']}/dismiss", {})
+        self.assertEqual(dismissed["suggestion"]["status"], "dismissed")
 
     def test_general_assistant_meeting_commands(self) -> None:
         raw = self.repo.create_meeting("Raw Assistant Meeting", audio_path="audio/raw.wav")
@@ -324,23 +481,136 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(response["summary"], "A project checklist is visible.")
         self.assertEqual(response["pending_actions"][0]["action"], "add_task")
 
+    def test_screenshot_analysis_dedupes_same_task_suggestions(self) -> None:
+        class FixedDate(date):
+            @classmethod
+            def today(cls) -> date:
+                return cls(2026, 6, 4)
+
+        raw = {
+            "summary": "A document asks for a status email.",
+            "visible_text": ["Send an email to Manasa about SpeedwagonAI by June 7th"],
+            "suggested_tasks": [
+                {
+                    "text": "Send an email to Manasa about SpeedwagonAI",
+                    "due_date": "2023-06-07",
+                    "project": "SpeedwagonAI",
+                    "confidence": 0.95,
+                }
+            ],
+            "suggested_context_topics": ["SpeedwagonAI"],
+            "suggested_actions": [
+                {
+                    "action": "add_task",
+                    "payload": {
+                        "text": "Send an email to Manasa about SpeedwagonAI",
+                        "due_date": "2023-06-07",
+                        "project": "SpeedwagonAI",
+                    },
+                    "confidence": 0.95,
+                    "explanation": "The screenshot contains a task.",
+                }
+            ],
+            "confidence": 0.95,
+            "provider": "mock",
+        }
+
+        with patch("speedwagon_ai.screenshot_context.date", FixedDate):
+            response = build_analysis_response(self.repo, raw, command="screenshot")
+
+        self.assertEqual(len(response["pending_actions"]), 1)
+        self.assertEqual(response["pending_actions"][0]["payload"]["due_date"], "2026-06-07")
+
     def test_commitments_daily_brief_and_future_surface_apis(self) -> None:
         created = self.post_json("/api/tasks", {"text": "Brief API task", "due_date": "2020-01-01"})
+        self.repo.upsert_calendar_event(
+            {
+                "provider_event_id": "event-1",
+                "calendar_id": "primary",
+                "title": "Calendar API review",
+                "start_at": "2026-06-08T10:00:00-07:00",
+                "end_at": "2026-06-08T10:30:00-07:00",
+            }
+        )
         commitments = self.get_json("/api/commitments")
         self.assertIn("commitments", commitments)
         self.assertTrue(any(item["id"] == created["task"]["id"] for item in commitments["items"]))
 
         brief = self.get_json("/api/daily-brief")
         self.assertTrue(any(task["text"] == "Brief API task" for task in brief["overdue"]))
+        self.assertIn("calendar_upcoming", brief)
 
         google = self.get_json("/api/integrations/google/status")
         self.assertIn("gmail_drafts", google)
+        self.assertIn("calendar_status", google)
+
+        calendar_status = self.get_json("/api/calendar/status")
+        self.assertEqual(calendar_status["status"], "missing_credentials")
+
+        upcoming = self.get_json("/api/calendar/upcoming")
+        self.assertTrue(any(event["title"] == "Calendar API review" for event in upcoming["events"]))
 
         apple = self.get_json("/api/integrations/apple/reminders")
         self.assertFalse(apple["available"])
 
         bot = self.get_json("/api/capture/bot/status")
         self.assertFalse(bot["enabled"])
+
+    def test_bot_capture_api_join_sync_and_process_with_fake_provider(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.post_json(
+                "/api/capture/bot/join",
+                {"meeting_url": "https://meet.google.com/abc-defg-hij", "title": "No Consent"},
+            )
+        self.assertEqual(failure.exception.code, 500)
+
+        with patch("speedwagon_ai.meeting_bot.provider_from_settings", return_value=FakeMeetingBotProvider(self.settings)):
+            joined = self.post_json(
+                "/api/capture/bot/join",
+                {
+                    "meeting_url": "https://meet.google.com/abc-defg-hij?authuser=0",
+                    "title": "Bot API",
+                    "consent_confirmed": True,
+                },
+            )
+            session = joined["session"]
+            sessions = self.get_json("/api/capture/bot/sessions")
+            synced = self.post_json(f"/api/capture/bot/sessions/{session['id']}/sync", {})
+
+            meeting = self.repo.get_meeting(session["meeting_id"])
+            with patch(
+                "speedwagon_ai.meeting_bot.process_meeting",
+                return_value={
+                    "meeting": meeting,
+                    "transcript_path": Path(synced["transcript_path"]),
+                    "note_path": self.settings.notes_dir / "bot-api.md",
+                    "commitments_path": self.settings.notes_dir / "commitments.md",
+                },
+            ):
+                processed = self.post_json(f"/api/capture/bot/sessions/{session['id']}/process", {})
+
+        self.assertTrue(any(item["id"] == session["id"] for item in sessions["sessions"]))
+        self.assertEqual(session["meeting_url_display"], "https://meet.google.com/abc-defg-hij")
+        self.assertTrue(Path(synced["transcript_path"]).exists())
+        self.assertEqual(processed["meeting"]["id"], session["meeting_id"])
+
+    def test_calendar_sync_api_uses_service(self) -> None:
+        with patch(
+            "speedwagon_ai.app.GoogleCalendarService.sync",
+            return_value={
+                "status": "synced",
+                "provider": "google",
+                "calendar_ids": ["primary"],
+                "time_min": "2026-05-21T00:00:00Z",
+                "time_max": "2026-07-04T00:00:00Z",
+                "synced_count": 1,
+                "events": [],
+            },
+        ) as sync:
+            result = self.post_json("/api/calendar/sync", {})
+
+        sync.assert_called_once()
+        self.assertEqual(result["synced_count"], 1)
 
     def get_json(self, path: str) -> dict:
         with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5) as response:

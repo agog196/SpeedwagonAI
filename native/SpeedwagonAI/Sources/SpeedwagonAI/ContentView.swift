@@ -5,7 +5,11 @@ import SwiftUI
 enum NativeSection: String, CaseIterable, Identifiable {
     case assistant = "Assistant"
     case capture = "Capture"
+    case meetings = "Meetings"
+    case calendar = "Calendar"
+    case notifications = "Notifications"
     case tasks = "Tasks"
+    case suggestions = "Suggestions"
     case commitments = "Commitments"
     case roadmap = "Roadmap"
 
@@ -15,7 +19,11 @@ enum NativeSection: String, CaseIterable, Identifiable {
         switch self {
         case .assistant: return "sparkle.magnifyingglass"
         case .capture: return "waveform"
+        case .meetings: return "rectangle.stack"
+        case .calendar: return "calendar"
+        case .notifications: return "bell"
         case .tasks: return "checklist"
+        case .suggestions: return "lightbulb"
         case .commitments: return "person.2"
         case .roadmap: return "map"
         }
@@ -25,7 +33,6 @@ enum NativeSection: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.colorScheme) private var scheme
-    @Environment(\.openWindow) private var openWindow
     @State private var selectedSection: NativeSection = .assistant
 
     var body: some View {
@@ -57,7 +64,7 @@ struct ContentView: View {
             }
 
             Button {
-                openWindow(id: "commandPalette")
+                AssistantPanelController.shared.toggle(state: state)
             } label: {
                 Label("Open Assistant", systemImage: "command")
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -92,16 +99,30 @@ struct ContentView: View {
             AssistantSurfaceView(expanded: true)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
                 CapturePanelView()
+                MeetingBotPanelView()
+                CalendarPanelView()
+                NotificationsPanelView(compact: true)
                 BrainCostPanelView()
                 DailyBriefView()
                 CommitmentsView()
                 PlannedCapabilitiesView()
             }
+            SuggestionsPanelView()
             TaskInboxView()
         case .capture:
             CapturePanelView()
+            MeetingBotPanelView()
+        case .meetings:
+            MeetingsView()
+        case .calendar:
+            CalendarPanelView(expanded: true)
+        case .notifications:
+            NotificationsPanelView()
         case .tasks:
+            SuggestionsPanelView()
             TaskInboxView()
+        case .suggestions:
+            SuggestionsPanelView()
         case .commitments:
             CommitmentsView()
             DailyBriefView()
@@ -192,6 +213,8 @@ struct AssistantSurfaceView: View {
             if expanded {
                 AssistantContextChips()
 
+                PaletteCaptureControlsView()
+
                 if let transcript = state.lastVoiceTranscript, !transcript.isEmpty {
                     Text("Voice: \(transcript)")
                         .font(.caption)
@@ -205,14 +228,65 @@ struct AssistantSurfaceView: View {
 
                 PendingActionsView()
 
+                SuggestionsPanelView(compact: true)
+
                 SuggestedActionsView()
             }
         }
         .speedwagonPanel()
         .onAppear {
-            activateSpeedwagon()
             commandFocused = true
         }
+    }
+}
+
+struct PaletteCaptureControlsView: View {
+    @EnvironmentObject private var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Meeting Capture", systemImage: "waveform")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Chip(text: state.meetingCaptureMode.rawValue)
+            }
+
+            Picker("Mode", selection: $state.meetingCaptureMode) {
+                ForEach(MeetingCaptureMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 8) {
+                TextField("Meeting title", text: $state.meetingCaptureTitle)
+                    .textFieldStyle(.roundedBorder)
+
+                Button(state.meetingCaptureMode == .nativeSystemMic ? "Start Native" : "Start Mic") {
+                    Task { await state.startMeetingCapture() }
+                }
+                .disabled(state.captureStatus?.isActive == true || state.meetingCaptureTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .speedwagonPointer()
+
+                Button("Stop") {
+                    Task { await state.stopCapture(process: false) }
+                }
+                .disabled(state.captureStatus?.isActive != true || state.captureStatus?.kind != "meeting")
+                .speedwagonPointer()
+
+                Button("Stop + Process") {
+                    Task { await state.stopCapture(process: true) }
+                }
+                .disabled(state.captureStatus?.isActive != true || state.captureStatus?.kind != "meeting")
+                .speedwagonPointer()
+            }
+
+            Text("Native mode records system/headphone audio plus mic for meetings. Voice Task stays mic-only.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .speedwagonSecondaryPanel()
     }
 }
 
@@ -226,6 +300,7 @@ struct AssistantContextChips: View {
             if let profile = state.captureDiagnostics?.captureProfile {
                 Chip(text: "\(profile) capture")
             }
+            Chip(text: "\(state.suggestions.count) suggestions")
             Chip(text: state.screenshotAnalysis == nil ? "screenshot ready" : "screenshot analyzed")
         }
     }
@@ -254,7 +329,6 @@ struct SuggestedActionsView: View {
 
 struct CommandPaletteView: View {
     @EnvironmentObject private var state: AppState
-    @Environment(\.dismiss) private var dismiss
     @State private var expanded = false
 
     var body: some View {
@@ -268,7 +342,7 @@ struct CommandPaletteView: View {
                     }
                     .speedwagonPointer()
                     Button("Close") {
-                        dismiss()
+                        AssistantPanelController.shared.close()
                     }
                     .keyboardShortcut(.escape, modifiers: [])
                     .speedwagonPointer()
@@ -279,36 +353,9 @@ struct CommandPaletteView: View {
             .padding(14)
         }
         .frame(minWidth: expanded ? 760 : 620, minHeight: expanded ? 560 : 220)
-        .background(PaletteWindowConfigurator())
         .task {
             await state.refreshAll()
         }
-    }
-}
-
-struct PaletteWindowConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            configure(view.window)
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            configure(nsView.window)
-        }
-    }
-
-    private func configure(_ window: NSWindow?) {
-        guard let window else { return }
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        window.isMovableByWindowBackground = true
-        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        window.standardWindowButton(.zoomButton)?.isHidden = true
-        window.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -335,10 +382,19 @@ struct CapturePanelView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Picker("Meeting capture mode", selection: $state.meetingCaptureMode) {
+                ForEach(MeetingCaptureMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            NativeCaptureStatusRows(snapshot: state.nativeCapturePermissions)
+
             HStack(spacing: 8) {
                 TextField("Meeting title", text: $state.meetingCaptureTitle)
                     .textFieldStyle(.roundedBorder)
-                Button("Start") {
+                Button(state.meetingCaptureMode == .nativeSystemMic ? "Start Native" : "Start Mic") {
                     Task { await state.startMeetingCapture() }
                 }
                 .disabled(state.captureStatus?.isActive == true || state.meetingCaptureTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -346,7 +402,7 @@ struct CapturePanelView: View {
             }
 
             HStack(spacing: 8) {
-                Button("Voice Task") {
+                Button("Voice Task (mic)") {
                     Task { await state.startTaskCapture() }
                 }
                 .disabled(state.captureStatus?.isActive == true)
@@ -355,13 +411,27 @@ struct CapturePanelView: View {
                 captureStopButtons
             }
 
-            if let warning = state.captureDiagnostics?.warnings.first {
+            Text(captureModeNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(state.nativeCaptureWarnings, id: \.self) { warning in
                 Text(warning)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SpeedwagonTheme.danger(scheme))
             }
         }
         .speedwagonPanel()
+    }
+
+    private var captureModeNote: String {
+        switch state.meetingCaptureMode {
+        case .nativeSystemMic:
+            return "Native system + mic applies to meeting recording only. Voice Task and assistant voice are mic-only in V14."
+        case .micFallback:
+            return state.captureDiagnostics?.warnings.first
+                ?? "Mic fallback records your selected/default microphone only."
+        }
     }
 
     @ViewBuilder
@@ -400,6 +470,280 @@ struct CapturePanelView: View {
     }
 }
 
+struct MeetingBotPanelView: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Meeting Bot Beta")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                StatusBadge(
+                    text: state.botStatus?.enabled == true ? "configured" : "not configured",
+                    color: state.botStatus?.enabled == true ? SpeedwagonTheme.accent(scheme) : SpeedwagonTheme.line(scheme)
+                )
+            }
+
+            Text("Optional cloud/provider capture for Zoom, Meet, Teams, and similar meeting links. Bots join visibly and should only be used when capture is allowed and disclosed. Refresh can request provider transcription for completed recordings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                InfoRow(label: "Provider", value: state.botStatus?.provider ?? state.settings?.botProvider ?? "not configured")
+                InfoRow(label: "Status", value: state.botStatus?.status ?? "unknown")
+                InfoRow(label: "Cost", value: state.botStatus?.cloudCostLabel ?? "higher")
+            }
+            .speedwagonSecondaryPanel()
+
+            VStack(spacing: 8) {
+                TextField("Meeting title", text: $state.botMeetingTitle)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Meeting link", text: $state.botMeetingURL)
+                    .textFieldStyle(.roundedBorder)
+                Toggle("Capture is allowed and disclosed for this meeting", isOn: $state.botConsentConfirmed)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await state.joinBotSession() }
+                } label: {
+                    Label("Join Bot", systemImage: "video.badge.waveform")
+                }
+                .disabled(
+                    state.botStatus?.enabled != true ||
+                    state.botMeetingTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    state.botMeetingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    !state.botConsentConfirmed
+                )
+                .speedwagonPointer()
+
+                Button {
+                    Task { await state.refreshAll(updateStatus: false) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .speedwagonPointer()
+            }
+
+            if let note = state.botStatus?.note ?? state.settings?.botNote {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if state.botSessions.isEmpty {
+                EmptyStateView(text: "No bot sessions yet.")
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(state.botSessions.prefix(5)) { session in
+                        BotSessionRow(session: session)
+                    }
+                }
+            }
+        }
+        .speedwagonPanel()
+    }
+}
+
+struct CalendarPanelView: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.colorScheme) private var scheme
+    var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Google Calendar")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                StatusBadge(
+                    text: state.calendarStatus?.status ?? state.settings?.calendarStatus ?? "unknown",
+                    color: state.calendarStatus?.enabled == true ? SpeedwagonTheme.accent(scheme) : SpeedwagonTheme.line(scheme)
+                )
+            }
+
+            Text("Read-only sync for daily brief and meeting prep. Events are cached locally in a limited rolling window.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                InfoRow(label: "Calendars", value: (state.calendarStatus?.calendarIds ?? state.settings?.calendarIds ?? ["primary"]).joined(separator: ", "))
+                InfoRow(label: "Window", value: "\(state.calendarStatus?.syncDaysBack ?? state.settings?.calendarSyncDaysBack ?? 14) back / \(state.calendarStatus?.syncDaysForward ?? state.settings?.calendarSyncDaysForward ?? 30) forward")
+                InfoRow(label: "Note", value: state.calendarStatus?.note ?? state.settings?.calendarNote ?? "Calendar status not loaded.")
+            }
+            .speedwagonSecondaryPanel()
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await state.syncCalendar() }
+                } label: {
+                    Label("Sync Calendar", systemImage: "arrow.clockwise")
+                }
+                .disabled(state.calendarStatus?.credentialsPresent == false)
+                .speedwagonPointer()
+
+                Button {
+                    Task { await state.refreshAll(updateStatus: false) }
+                } label: {
+                    Label("Refresh", systemImage: "calendar")
+                }
+                .speedwagonPointer()
+            }
+
+            if expanded {
+                Text("Upcoming")
+                    .font(.headline)
+                CalendarEventList(events: state.calendarEvents)
+            } else {
+                CalendarEventList(events: Array(state.calendarEvents.prefix(3)))
+            }
+        }
+        .speedwagonPanel()
+    }
+}
+
+struct CalendarEventList: View {
+    let events: [CalendarEvent]
+
+    var body: some View {
+        if events.isEmpty {
+            EmptyStateView(text: "No synced upcoming events.")
+        } else {
+            VStack(spacing: 8) {
+                ForEach(events) { event in
+                    CalendarEventRow(event: event)
+                }
+            }
+        }
+    }
+}
+
+struct CalendarEventRow: View {
+    let event: CalendarEvent
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(event.title)
+                .font(.callout.weight(.medium))
+                .lineLimit(2)
+            Text("\(event.startAt) -> \(event.endAt)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if let meetingURL = event.meetingUrl, !meetingURL.isEmpty {
+                Text(meetingURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if let location = event.location, !location.isEmpty {
+                Text(location)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .speedwagonSecondaryPanel()
+    }
+}
+
+struct BotSessionRow: View {
+    @EnvironmentObject private var state: AppState
+    let session: BotSession
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.displayTitle)
+                        .font(.callout.weight(.medium))
+                    Text("Session \(session.id) · meeting \(session.meetingId) · \(session.status)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Chip(text: transcriptChipText)
+            }
+
+            if let display = session.meetingUrlDisplay, !display.isEmpty {
+                Text(display)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if let error = session.error, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else if session.transcriptReady != true && session.meetingTranscriptPath == nil {
+                Text(transcriptHelpText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button("Sync") {
+                    Task { await state.syncBotSession(session) }
+                }
+                .speedwagonPointer()
+                Button("Process") {
+                    Task { await state.processBotSession(session) }
+                }
+                .disabled(session.transcriptReady != true && session.meetingTranscriptPath == nil)
+                .speedwagonPointer()
+            }
+        }
+        .speedwagonSecondaryPanel()
+    }
+
+    private var transcriptChipText: String {
+        if session.transcriptReady == true || session.meetingTranscriptPath != nil {
+            return "transcript ready"
+        }
+        if session.status == "transcript_requested" {
+            return "transcript requested"
+        }
+        if session.status.hasPrefix("transcript_processing") {
+            return "transcript processing"
+        }
+        return "no transcript yet"
+    }
+
+    private var transcriptHelpText: String {
+        if session.status == "transcript_requested" {
+            return "Recall transcription has been requested. Sync again after it finishes."
+        }
+        if session.status.hasPrefix("transcript_processing") {
+            return "Recall is still processing the transcript. Sync again in a few minutes."
+        }
+        return "Process unlocks after Sync imports a transcript."
+    }
+}
+
+struct NativeCaptureStatusRows: View {
+    let snapshot: NativeCapturePermissionSnapshot
+
+    var body: some View {
+        VStack(spacing: 5) {
+            ForEach(snapshot.rows, id: \.0) { row in
+                HStack {
+                    Text(row.0)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(row.1)
+                        .font(.caption.weight(.medium))
+                }
+                .font(.caption)
+            }
+        }
+        .speedwagonSecondaryPanel()
+    }
+}
+
 struct ActiveCaptureView: View {
     let session: CaptureSession?
 
@@ -411,10 +755,16 @@ struct ActiveCaptureView: View {
                 HStack(spacing: 12) {
                     Label(session.startedAt ?? "unknown start", systemImage: "clock")
                     Label("\(session.fileSize ?? 0) bytes", systemImage: "waveform")
-                    Label(session.captureProfile ?? "profile", systemImage: "mic")
+                    Label(session.captureProfile ?? "profile", systemImage: session.isNative ? "display.and.arrow.down" : "mic")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                if let warning = session.warnings?.first {
+                    Text(warning)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
                 if let audioPath = session.audioPath {
                     Text(audioPath)
                         .font(.caption)
@@ -452,6 +802,15 @@ struct DailyBriefView: View {
                     BriefCard(title: "Today", tasks: brief.today)
                     BriefCard(title: "Waiting", tasks: brief.waiting)
                     BriefCard(title: "Follow-ups", tasks: brief.recommendedFollowups)
+                }
+                if let today = brief.calendarToday, !today.isEmpty {
+                    CalendarBriefCard(title: "Calendar Today", events: today)
+                }
+                if let upcoming = brief.calendarUpcoming, !upcoming.isEmpty {
+                    CalendarBriefCard(title: "Upcoming Meetings", events: Array(upcoming.prefix(4)))
+                }
+                if let prep = brief.meetingPrep, !prep.isEmpty {
+                    MeetingPrepList(prep: prep)
                 }
             } else {
                 EmptyStateView(text: state.isConnected ? "No brief loaded." : "Connect backend to load brief.")
@@ -491,6 +850,52 @@ struct BriefCard: View {
     }
 }
 
+struct CalendarBriefCard: View {
+    let title: String
+    let events: [CalendarEvent]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title)
+                    .font(.headline)
+                Spacer()
+                Text("\(events.count)")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(events.prefix(3)) { event in
+                Text("\(event.startAt) \(event.title)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .speedwagonSecondaryPanel()
+    }
+}
+
+struct MeetingPrepList: View {
+    let prep: [MeetingPrepItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Meeting Prep")
+                .font(.headline)
+            ForEach(Array(prep.prefix(3).enumerated()), id: \.offset) { _, item in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.event.title)
+                        .font(.caption.weight(.semibold))
+                    Text("\((item.tasks ?? []).count) related tasks · \((item.meetings ?? []).count) related meetings")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .speedwagonSecondaryPanel()
+            }
+        }
+    }
+}
+
 struct CommitmentsView: View {
     @EnvironmentObject private var state: AppState
 
@@ -510,6 +915,169 @@ struct CommitmentsView: View {
             }
         }
         .speedwagonPanel()
+    }
+}
+
+struct MeetingsView: View {
+    @EnvironmentObject private var state: AppState
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Meetings")
+                        .font(.title3.weight(.semibold))
+                    Spacer()
+                    Chip(text: "\(state.meetings.count)")
+                }
+
+                if state.meetings.isEmpty {
+                    EmptyStateView(text: state.isConnected ? "No meetings yet." : "Connect backend to load meetings.")
+                } else {
+                    ScrollView {
+                        VStack(spacing: 8) {
+                            ForEach(state.meetings) { meeting in
+                                MeetingListRow(meeting: meeting)
+                            }
+                        }
+                    }
+                    .frame(minHeight: 420)
+                }
+            }
+            .speedwagonPanel()
+            .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
+
+            MeetingDetailView()
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+struct MeetingListRow: View {
+    @EnvironmentObject private var state: AppState
+    let meeting: MeetingItem
+
+    var body: some View {
+        Button {
+            Task { await state.loadMeeting(meeting) }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(meeting.title)
+                        .font(.body.weight(.semibold))
+                        .lineLimit(2)
+                    Spacer()
+                    if meeting.sourceType == "meeting_bot" {
+                        Chip(text: "bot")
+                    }
+                }
+                Text("\((meeting.startedAt ?? "").prefix(10)) · meeting \(meeting.id)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Chip(text: meeting.transcriptPath == nil ? "no transcript" : "transcript")
+                    Chip(text: meeting.notePath == nil ? "no note" : "note")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .speedwagonSecondaryPanel()
+        .speedwagonPointer()
+    }
+}
+
+struct MeetingDetailView: View {
+    @EnvironmentObject private var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let detail = state.selectedMeetingDetail {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(detail.meeting.title)
+                            .font(.title3.weight(.semibold))
+                        Text("meeting \(detail.meeting.id) · \((detail.meeting.startedAt ?? "").prefix(10))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Process") {
+                        Task { await state.processMeeting(detail.meeting) }
+                    }
+                    .speedwagonPointer()
+                }
+
+                Text(detail.meeting.summary ?? "No summary yet.")
+                    .font(.callout)
+                    .foregroundStyle(detail.meeting.summary == nil ? .secondary : .primary)
+
+                MeetingItemsBlock(title: "Decisions", items: detail.decisions)
+                MeetingItemsBlock(title: "Action Items", items: detail.actionItems)
+                MeetingItemsBlock(title: "Commitments", items: detail.commitments)
+                MeetingItemsBlock(title: "Open Questions", items: detail.openQuestions)
+
+                if let transcript = detail.transcript, !transcript.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Transcript")
+                            .font(.headline)
+                        Text(transcript)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(.quaternary.opacity(0.4))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    if let transcriptPath = detail.meeting.transcriptPath {
+                        Text("Transcript: \(transcriptPath)")
+                    }
+                    if let notePath = detail.meeting.notePath {
+                        Text("Note: \(notePath)")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                EmptyStateView(text: state.meetings.isEmpty ? "No meetings yet." : "Select a meeting to review transcript, decisions, tasks, and notes.")
+            }
+        }
+        .speedwagonPanel()
+    }
+}
+
+struct MeetingItemsBlock: View {
+    let title: String
+    let items: [MeetingTextItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.headline)
+            if items.isEmpty {
+                Text("None captured.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(items) { item in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("•")
+                            Text(item.displayText)
+                            if let deadline = item.deadline, !deadline.isEmpty {
+                                Text("due \(deadline)")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -770,6 +1338,210 @@ struct PendingActionCard: View {
     }
 }
 
+struct SuggestionsPanelView: View {
+    @EnvironmentObject private var state: AppState
+    var compact = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Follow-Through Suggestions")
+                    .font(compact ? .headline : .title3.weight(.semibold))
+                Spacer()
+                Chip(text: "\(state.suggestions.count)")
+            }
+
+            if state.suggestions.isEmpty {
+                EmptyStateView(text: state.isConnected ? "No suggestions right now." : "Connect backend to load suggestions.")
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(state.suggestions.prefix(compact ? 3 : 12)) { suggestion in
+                        SuggestionCard(suggestion: suggestion)
+                    }
+                }
+            }
+        }
+        .speedwagonPanel()
+    }
+}
+
+struct NotificationsPanelView: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.colorScheme) private var scheme
+    var compact = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Notifications")
+                    .font(compact ? .headline : .title3.weight(.semibold))
+                Spacer()
+                Chip(text: state.notificationPermissionStatus)
+            }
+
+            if let status = state.notificationStatus {
+                Text(status.note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Chip(text: "\(status.candidateCount) candidates")
+                    Chip(text: "\(status.deliveredCount) delivered")
+                    Chip(text: "\(status.snoozedCount) snoozed")
+                }
+            } else {
+                Text("Notification status has not loaded yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await state.requestNotificationPermission() }
+                } label: {
+                    Label("Allow Notifications", systemImage: "bell.badge")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(SpeedwagonTheme.accent(scheme))
+                .disabled(state.notificationPermissionStatus == "authorized")
+                .speedwagonPointer()
+
+                Button {
+                    Task { await state.refreshNotificationsOnly() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+            }
+
+            if state.notificationCandidates.isEmpty {
+                EmptyStateView(text: state.isConnected ? "No notification candidates right now." : "Connect backend to load notifications.")
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(state.notificationCandidates.prefix(compact ? 2 : 10)) { suggestion in
+                        NotificationCandidateCard(suggestion: suggestion)
+                    }
+                }
+            }
+        }
+        .speedwagonPanel()
+    }
+}
+
+struct NotificationCandidateCard: View {
+    @EnvironmentObject private var state: AppState
+    let suggestion: SuggestionItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("#\(suggestion.id) \(suggestion.title)")
+                        .font(.body.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(suggestion.notificationReason ?? suggestion.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Chip(text: suggestion.notificationStatus ?? "candidate")
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await state.markNotificationDelivered(suggestion) }
+                } label: {
+                    Label("Mark Delivered", systemImage: "paperplane")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+
+                Button {
+                    Task { await state.snoozeNotification(suggestion) }
+                } label: {
+                    Label("Snooze", systemImage: "clock")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+
+                Button(role: .cancel) {
+                    Task { await state.dismissNotification(suggestion) }
+                } label: {
+                    Label("Dismiss", systemImage: "xmark.circle")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.25))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct SuggestionCard: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.colorScheme) private var scheme
+    let suggestion: SuggestionItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text("#\(suggestion.id) \(suggestion.title)")
+                            .font(.body.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let context = suggestion.displayContext {
+                            Chip(text: context)
+                        }
+                    }
+                    Text(suggestion.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(suggestion.proposedAction.replacingOccurrences(of: "_", with: " "))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let confidence = suggestion.confidence {
+                    Chip(text: "\(Int(confidence * 100))%")
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await state.confirm(suggestion) }
+                } label: {
+                    Label("Confirm", systemImage: "checkmark.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(SpeedwagonTheme.accent(scheme))
+                .speedwagonPointer()
+
+                Button {
+                    Task { await state.snooze(suggestion) }
+                } label: {
+                    Label("Snooze", systemImage: "clock")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+
+                Button(role: .cancel) {
+                    Task { await state.dismiss(suggestion) }
+                } label: {
+                    Label("Dismiss", systemImage: "xmark.circle")
+                }
+                .buttonStyle(.bordered)
+                .speedwagonPointer()
+            }
+        }
+        .speedwagonSecondaryPanel()
+    }
+}
+
 struct ResultContent: View {
     let response: AssistantCommandResponse
 
@@ -823,9 +1595,39 @@ struct ResultContent: View {
                 }
             }
 
+            if let contexts = response.result?.contexts, !contexts.isEmpty {
+                HStack {
+                    ForEach(contexts.prefix(6)) { context in
+                        Chip(text: context.name)
+                    }
+                }
+            }
+
+            if let suggestions = response.result?.suggestions, !suggestions.isEmpty {
+                ForEach(suggestions.prefix(5)) { suggestion in
+                    Text("#\(suggestion.id) \(suggestion.title)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let suggestion = response.result?.suggestion {
+                Text("#\(suggestion.id) \(suggestion.title) [\(suggestion.status)]")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let meetings = response.result?.meetings, !meetings.isEmpty {
                 ForEach(meetings.prefix(6)) { meeting in
                     Text("#\(meeting.id) \(meeting.title)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let sessions = response.result?.sessions, !sessions.isEmpty {
+                ForEach(sessions.prefix(6)) { session in
+                    Text("#\(session.id) \(session.displayTitle) · \(session.status)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -839,6 +1641,12 @@ struct ResultContent: View {
 
             if let meeting = response.result?.meeting {
                 Text("#\(meeting.id) \(meeting.title)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let session = response.result?.session {
+                Text("#\(session.id) \(session.displayTitle) · \(session.status)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -966,6 +1774,14 @@ struct TaskRow: View {
                     Text(suggestion)
                         .font(.caption)
                         .foregroundStyle(.orange)
+                }
+
+                if let contexts = task.contexts, !contexts.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(contexts.prefix(4)) { context in
+                            Chip(text: context.name)
+                        }
+                    }
                 }
             }
 
