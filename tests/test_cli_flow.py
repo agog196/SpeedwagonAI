@@ -64,6 +64,15 @@ class CliFlowTests(unittest.TestCase):
                     ask_task = next(task for task in repo.list_tasks(status="open") if task["text"] == "ask cli task")
                     self.assertEqual(main(["ask", f"complete task {ask_task['id']}"]), 0)
                     self.assertEqual(repo.get_task(ask_task["id"])["status"], "done")
+                    self.assertEqual(main(["ask", "what can you do"]), 0)
+                    self.assertEqual(main(["assistant", "capabilities"]), 0)
+
+                    raw = repo.create_meeting("Second Fixture", audio_path=str(root / "audio" / "second.wav"))
+                    second_transcript = root / "transcripts" / "meeting-2.txt"
+                    second_transcript.write_text("We need to send a launch email by Friday.", encoding="utf-8")
+                    repo.update_meeting(raw.id, transcript_path=str(second_transcript))
+                    self.assertEqual(main(["ask", "process latest meeting"]), 0)
+                    self.assertIsNotNone(repo.get_meeting(raw.id).note_path)
                 finally:
                     os.chdir(old_cwd)
 

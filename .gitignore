@@ -12,3 +12,7 @@ __pycache__/
 *.py[cod]
 .claude/
 .cursor/
+.build/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -95,19 +95,69 @@ CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL,
     owner TEXT,
+    owed_to TEXT,
+    project TEXT,
     due_date TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     source TEXT NOT NULL DEFAULT 'manual',
+    source_type TEXT NOT NULL DEFAULT 'manual',
     source_table TEXT,
     source_id INTEGER,
     source_meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     reminder_suggestion TEXT,
+    snoozed_until TEXT,
+    last_followed_up_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL DEFAULT 'local',
+    remind_at TEXT,
+    status TEXT NOT NULL DEFAULT 'suggested',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS assistant_pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    command TEXT NOT NULL,
+    action TEXT NOT NULL,
+    category TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    confidence REAL,
+    source TEXT NOT NULL DEFAULT 'llm',
+    explanation TEXT,
+    safety_notes_json TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT
+);
 """
+
+ACTIVE_TASK_STATUSES = {"open", "waiting", "snoozed", "uncertain"}
+FINAL_TASK_STATUSES = {"done", "canceled"}
+TASK_STATUSES = ACTIVE_TASK_STATUSES | FINAL_TASK_STATUSES
+SOURCE_TYPES = {"local_recording", "meeting_bot", "gmail", "calendar", "manual", "document", "action_item", "commitment"}
 
 
 class Repository:
@@ -126,7 +176,12 @@ class Repository:
             conn.executescript(SCHEMA)
             self._ensure_column(conn, "email_drafts", "tone", "TEXT")
             self._ensure_column(conn, "email_drafts", "included_items_json", "TEXT")
+            self._ensure_column(conn, "tasks", "owed_to", "TEXT")
+            self._ensure_column(conn, "tasks", "project", "TEXT")
+            self._ensure_column(conn, "tasks", "source_type", "TEXT NOT NULL DEFAULT 'manual'")
             self._ensure_column(conn, "tasks", "reminder_suggestion", "TEXT")
+            self._ensure_column(conn, "tasks", "snoozed_until", "TEXT")
+            self._ensure_column(conn, "tasks", "last_followed_up_at", "TEXT")
             self.sync_tasks_from_existing_work(conn)
 
     def create_meeting(self, title: str, audio_path: str | None = None) -> Meeting:
@@ -156,6 +211,28 @@ class Repository:
                 (limit,),
             ).fetchall()
         return [self._meeting_from_row(row) for row in rows]
+
+    def list_unprocessed_meetings(self, limit: int = 20) -> list[Meeting]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM meetings
+                WHERE audio_path IS NOT NULL
+                  AND (
+                    transcript_path IS NULL
+                    OR summary IS NULL
+                    OR note_path IS NULL
+                  )
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._meeting_from_row(row) for row in rows]
+
+    def latest_unprocessed_meeting(self) -> Meeting | None:
+        meetings = self.list_unprocessed_meetings(limit=1)
+        return meetings[0] if meetings else None
 
     def update_meeting(self, meeting_id: int, **fields: Any) -> Meeting:
         allowed = {"ended_at", "audio_path", "transcript_path", "note_path", "summary", "raw_extraction_json"}
@@ -189,7 +266,7 @@ class Repository:
                 DELETE FROM tasks
                 WHERE source_meeting_id = ?
                   AND source IN ('action_item', 'commitment')
-                  AND status != 'done'
+                  AND status NOT IN ('done', 'canceled')
                 """,
                 (meeting_id,),
             )
@@ -218,7 +295,7 @@ class Repository:
             }
 
     def unresolved_work(self) -> list[dict[str, Any]]:
-        return self.list_tasks(status="open")
+        return self.list_commitments()
 
     def list_tasks(self, status: str | None = "open", include_done: bool = False) -> list[dict[str, Any]]:
         conditions = []
@@ -227,7 +304,7 @@ class Repository:
             conditions.append("tasks.status = ?")
             params.append(status)
         elif not include_done:
-            conditions.append("tasks.status != 'done'")
+            conditions.append("tasks.status NOT IN ('done', 'canceled')")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"""
         SELECT
@@ -266,7 +343,7 @@ class Repository:
             meetings.started_at
         FROM tasks
         LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
-        WHERE tasks.status != 'done'
+        WHERE tasks.status NOT IN ('done', 'canceled', 'snoozed')
           AND tasks.due_date IS NOT NULL
           AND tasks.due_date < ?
         ORDER BY tasks.due_date, tasks.created_at DESC
@@ -283,27 +360,37 @@ class Repository:
         source: str = "manual",
         source_meeting_id: int | None = None,
         confidence: float = 1.0,
+        owed_to: str | None = None,
+        project: str | None = None,
+        status: str = "open",
+        source_type: str | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("Task text is required")
+        status = normalize_task_status(status)
+        source_type = normalize_source_type(source_type or source)
         now = utc_now_iso()
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO tasks (
-                    text, owner, due_date, status, source, source_meeting_id,
-                    confidence, reminder_suggestion, created_at, updated_at
+                    text, owner, owed_to, project, due_date, status, source, source_type,
+                    source_meeting_id, confidence, reminder_suggestion, created_at, updated_at
                 )
-                VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     text.strip(),
                     _optional(owner),
+                    _optional(owed_to),
+                    _optional(project),
                     _optional(due_date),
+                    status,
                     source,
+                    source_type,
                     source_meeting_id,
                     confidence,
-                    reminder_suggestion(_optional(due_date)),
+                    reminder_suggestion(_optional(due_date), status=status),
                     now,
                     now,
                 ),
@@ -334,7 +421,11 @@ class Repository:
         now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?",
+                """
+                UPDATE tasks
+                SET status = 'done', completed_at = ?, snoozed_until = NULL, updated_at = ?
+                WHERE id = ?
+                """,
                 (now, now, task_id),
             )
         return self.get_task(task_id)
@@ -343,10 +434,141 @@ class Repository:
         now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ? WHERE id = ?",
+                """
+                UPDATE tasks
+                SET status = 'open', completed_at = NULL, snoozed_until = NULL, updated_at = ?
+                WHERE id = ?
+                """,
                 (now, task_id),
             )
         return self.get_task(task_id)
+
+    def update_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        snoozed_until: str | None = None,
+    ) -> dict[str, Any]:
+        status = normalize_task_status(status)
+        now = utc_now_iso()
+        completed_at = now if status == "done" else None
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?, completed_at = ?, snoozed_until = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, completed_at, _optional(snoozed_until), now, task_id),
+            )
+        return self.get_task(task_id)
+
+    def snooze_task(self, task_id: int, until: str | None = None) -> dict[str, Any]:
+        if not until:
+            until = (date.today() + timedelta(days=1)).isoformat()
+        return self.update_task_status(task_id, "snoozed", snoozed_until=until)
+
+    def cancel_task(self, task_id: int) -> dict[str, Any]:
+        return self.update_task_status(task_id, "canceled")
+
+    def list_commitments(
+        self,
+        status: str | None = None,
+        include_final: bool = False,
+        person: str | None = None,
+        project: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = []
+        params: list[Any] = []
+        if status:
+            conditions.append("tasks.status = ?")
+            params.append(normalize_task_status(status))
+        elif not include_final:
+            conditions.append("tasks.status NOT IN ('done', 'canceled')")
+        if person:
+            needle = f"%{person.lower()}%"
+            conditions.append(
+                "(lower(coalesce(tasks.owner, '')) LIKE ? OR lower(coalesce(tasks.owed_to, '')) LIKE ? OR lower(tasks.text) LIKE ?)"
+            )
+            params.extend([needle, needle, needle])
+        if project:
+            needle = f"%{project.lower()}%"
+            conditions.append("(lower(coalesce(tasks.project, '')) LIKE ? OR lower(tasks.text) LIKE ?)")
+            params.extend([needle, needle])
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+        SELECT
+            tasks.*,
+            tasks.source AS kind,
+            tasks.due_date AS deadline,
+            tasks.source_meeting_id AS meeting_id,
+            meetings.title AS meeting_title,
+            meetings.started_at,
+            tasks.owner IS NULL AS owner_missing,
+            tasks.due_date IS NULL AS deadline_missing
+        FROM tasks
+        LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+        {where}
+        ORDER BY
+            tasks.status = 'done',
+            tasks.status = 'canceled',
+            deadline_missing,
+            tasks.due_date,
+            tasks.updated_at DESC
+        """
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._task_dict(row) for row in rows]
+
+    def daily_brief(self, today: date | None = None) -> dict[str, Any]:
+        current = today or date.today()
+        today_iso = current.isoformat()
+        stale_before = (current - timedelta(days=7)).isoformat()
+        tasks = self.list_commitments(include_final=False)
+        brief = {
+            "date": today_iso,
+            "overdue": [],
+            "today": [],
+            "upcoming": [],
+            "waiting": [],
+            "snoozed": [],
+            "uncertain": [],
+            "stale": [],
+            "unscheduled": [],
+            "recommended_followups": [],
+        }
+        for task in tasks:
+            due = task.get("due_date")
+            status = task.get("status")
+            if status == "waiting":
+                brief["waiting"].append(task)
+            elif status == "snoozed":
+                brief["snoozed"].append(task)
+            elif status == "uncertain":
+                brief["uncertain"].append(task)
+
+            if due and due < today_iso and status != "snoozed":
+                brief["overdue"].append(task)
+            elif due == today_iso:
+                brief["today"].append(task)
+            elif due and due > today_iso:
+                brief["upcoming"].append(task)
+            elif not due and status in ACTIVE_TASK_STATUSES:
+                brief["unscheduled"].append(task)
+
+            updated_day = str(task.get("updated_at") or "")[:10]
+            if status in {"open", "waiting", "uncertain"} and not due and updated_day and updated_day <= stale_before:
+                brief["stale"].append(task)
+
+        brief["recommended_followups"] = [
+            *brief["overdue"][:5],
+            *brief["waiting"][:3],
+            *brief["uncertain"][:3],
+            *brief["stale"][:3],
+        ]
+        brief["counts"] = {key: len(value) for key, value in brief.items() if isinstance(value, list)}
+        return brief
 
     def context_for_topic(self, topic: str, limit: int = 8) -> dict[str, Any]:
         needle = f"%{topic.lower()}%"
@@ -432,6 +654,86 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def create_pending_action(
+        self,
+        *,
+        command: str,
+        action: str,
+        category: str,
+        payload: dict[str, Any],
+        confidence: float | None = None,
+        source: str = "llm",
+        explanation: str | None = None,
+        safety_notes: list[str] | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO assistant_pending_actions (
+                    command, action, category, payload_json, confidence, source,
+                    explanation, safety_notes_json, status, created_at, updated_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    command,
+                    action,
+                    category,
+                    json.dumps(payload, sort_keys=True),
+                    confidence,
+                    source,
+                    explanation,
+                    json.dumps(safety_notes or []),
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            action_id = int(cur.lastrowid)
+        return self.get_pending_action(action_id)
+
+    def get_pending_action(self, action_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM assistant_pending_actions WHERE id = ?", (action_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Pending assistant action {action_id} not found")
+        return self._pending_action_dict(row)
+
+    def list_pending_actions(self, status: str | None = "pending") -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM assistant_pending_actions
+                {where}
+                ORDER BY created_at DESC, id DESC
+                """,
+                params,
+            ).fetchall()
+        return [self._pending_action_dict(row) for row in rows]
+
+    def update_pending_action_status(self, action_id: int, status: str) -> dict[str, Any]:
+        normalized = status.strip().lower()
+        if normalized not in {"pending", "confirmed", "canceled", "expired"}:
+            raise ValueError(f"Unsupported pending action status: {status}")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE assistant_pending_actions
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized, now, action_id),
+            )
+        return self.get_pending_action(action_id)
+
     def sync_tasks_from_existing_work(self, conn: sqlite3.Connection | None = None) -> None:
         owns_connection = conn is None
         active_conn = conn or self.connect()
@@ -441,7 +743,7 @@ class Repository:
                 rows = active_conn.execute(
                     f"""
                     SELECT * FROM {table}
-                    WHERE status != 'done'
+                    WHERE status NOT IN ('done', 'canceled')
                       AND NOT EXISTS (
                         SELECT 1 FROM tasks
                         WHERE tasks.source_table = ?
@@ -454,10 +756,10 @@ class Repository:
                     active_conn.execute(
                         """
                         INSERT INTO tasks (
-                            text, owner, due_date, status, source, source_table, source_id,
+                            text, owner, due_date, status, source, source_type, source_table, source_id,
                             source_meeting_id, confidence, reminder_suggestion, created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.85, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.85, ?, ?, ?)
                         """,
                         (
                             row["text"],
@@ -465,10 +767,11 @@ class Repository:
                             row["deadline"],
                             row["status"],
                             source,
+                            source,
                             table,
                             row["id"],
                             row["meeting_id"],
-                            reminder_suggestion(row["deadline"]),
+                            reminder_suggestion(row["deadline"], status=row["status"]),
                             now,
                             now,
                         ),
@@ -519,10 +822,10 @@ class Repository:
         conn.execute(
             """
             INSERT INTO tasks (
-                text, owner, due_date, status, source, source_table, source_id,
+                text, owner, due_date, status, source, source_type, source_table, source_id,
                 source_meeting_id, confidence, reminder_suggestion, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.9, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.9, ?, ?, ?)
             """,
             (
                 item.text,
@@ -530,10 +833,11 @@ class Repository:
                 item.deadline,
                 item.status,
                 source,
+                source,
                 source_table,
                 source_id,
                 meeting_id,
-                reminder_suggestion(item.deadline),
+                reminder_suggestion(item.deadline, status=item.status),
                 now,
                 now,
             ),
@@ -560,6 +864,19 @@ class Repository:
         return [dict(row) for row in rows]
 
     @staticmethod
+    def _pending_action_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        except json.JSONDecodeError:
+            item["payload"] = {}
+        try:
+            item["safety_notes"] = json.loads(item.pop("safety_notes_json") or "[]")
+        except json.JSONDecodeError:
+            item["safety_notes"] = []
+        return item
+
+    @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
@@ -573,9 +890,9 @@ class Repository:
         item["deadline"] = due
         item["kind"] = item.get("source")
         item["meeting_id"] = item.get("source_meeting_id")
-        item["is_overdue"] = bool(item.get("status") != "done" and due and due < current.isoformat())
-        if item.get("status") != "done":
-            item["reminder_suggestion"] = reminder_suggestion(due, today=current)
+        item["is_overdue"] = bool(item.get("status") not in FINAL_TASK_STATUSES and due and due < current.isoformat())
+        if item.get("status") not in FINAL_TASK_STATUSES:
+            item["reminder_suggestion"] = reminder_suggestion(due, today=current, status=item.get("status"))
         return item
 
 
@@ -586,7 +903,29 @@ def _optional(value: str | None) -> str | None:
     return text or None
 
 
-def reminder_suggestion(due_date: str | None, today: date | None = None) -> str | None:
+def normalize_task_status(status: str) -> str:
+    normalized = (status or "open").strip().lower().replace("-", "_")
+    if normalized == "complete":
+        normalized = "done"
+    if normalized not in TASK_STATUSES:
+        raise ValueError(f"Unsupported task status: {status}")
+    return normalized
+
+
+def normalize_source_type(source_type: str) -> str:
+    normalized = (source_type or "manual").strip().lower().replace("-", "_")
+    if normalized not in SOURCE_TYPES:
+        return "manual"
+    return normalized
+
+
+def reminder_suggestion(due_date: str | None, today: date | None = None, status: str | None = None) -> str | None:
+    if status == "waiting":
+        return "Waiting on someone else. Consider a gentle follow-up."
+    if status == "uncertain":
+        return "Speedwagon is unsure whether this is resolved. Confirm, snooze, or follow up."
+    if status == "snoozed":
+        return "Snoozed. Review when it comes back into focus."
     if not due_date:
         return None
     current = today or date.today()

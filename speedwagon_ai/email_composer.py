@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from speedwagon_ai.config import Settings
+from speedwagon_ai.model_router import choose_model
 from speedwagon_ai.storage import Repository
 
 
@@ -61,8 +62,9 @@ class EmailComposer:
         subject: str | None,
         instruction: str,
     ) -> EmailDraftContent:
+        model = choose_model(self.settings, "email_draft")
         payload = {
-            "model": self.settings.openai_model,
+            "model": model.model,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": EMAIL_SYSTEM_PROMPT},

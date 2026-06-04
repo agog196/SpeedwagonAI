@@ -14,8 +14,11 @@ SpeedwagonAI is currently a local Python engine with a browser UI and HTTP API. 
 - Menu bar or compact command UI for quick capture, context lookup, and follow-up drafting.
 - macOS notifications for due or overdue commitments.
 - Apple Reminders integration for confirmed commitments.
+- Daily brief view for overdue, due-today, waiting, uncertain, and stale work.
 - A SwiftUI task inbox backed by the local `/api/tasks` endpoints.
+- A SwiftUI commitment inbox backed by `/api/commitments` and `/api/daily-brief`.
 - ScreenCaptureKit-based meeting/system audio capture as a cleaner long-term alternative to virtual routing.
+- Optional managed meeting bot capture for meetings where speaker/platform metadata matters.
 - Apple Mail / Outlook / Gmail provider adapters.
 - Google Drive / Docs editing through explicit user-approved integrations.
 

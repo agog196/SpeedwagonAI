@@ -28,7 +28,7 @@ class MarkdownWriter:
     def write_commitments(self) -> Path:
         self.settings.notes_dir.mkdir(parents=True, exist_ok=True)
         path = self.settings.notes_dir / "commitments.md"
-        path.write_text(render_commitments_markdown(self.repo.list_tasks(status="open")), encoding="utf-8")
+        path.write_text(render_commitments_markdown(self.repo.list_commitments()), encoding="utf-8")
         return path
 
 
@@ -115,11 +115,14 @@ def render_commitments_markdown(rows: list[dict[str, Any]]) -> str:
         lines.extend([f"## {owner}", ""])
         for row in grouped[owner]:
             due = f" due {row['deadline']}" if row.get("deadline") else ""
+            status = f" [{row['status']}]" if row.get("status") and row.get("status") != "open" else ""
+            owed_to = f" → {row['owed_to']}" if row.get("owed_to") else ""
+            project = f" #{row['project']}" if row.get("project") else ""
             meeting = row.get("meeting_title") or "Manual task"
             meeting_id = f"; meeting {row['meeting_id']}" if row.get("meeting_id") else ""
             suggestion = f" — {row['reminder_suggestion']}" if row.get("reminder_suggestion") else ""
             lines.append(
-                f"- [{row['kind']}] {row['text']}{due} "
+                f"- [{row['kind']}] {row['text']}{status}{owed_to}{project}{due} "
                 f"([[{meeting}]]{meeting_id}){suggestion}"
             )
         lines.append("")

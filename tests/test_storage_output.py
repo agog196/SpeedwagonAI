@@ -8,9 +8,9 @@ from pathlib import Path
 
 from speedwagon_ai.config import Settings
 from speedwagon_ai.email_composer import fallback_compose, parse_email_content
-from speedwagon_ai.extraction import parse_extraction
+from speedwagon_ai.extraction import fallback_extract, parse_extraction
 from speedwagon_ai.integrations.gmail import preview_followup_email
-from speedwagon_ai.models import ExtractionResult, ExtractedItem
+from speedwagon_ai.models import ExtractionResult, ExtractedItem, Meeting
 from speedwagon_ai.output import MarkdownWriter, render_commitments_markdown, render_meeting_markdown
 from speedwagon_ai.storage import Repository
 
@@ -100,6 +100,48 @@ class StorageOutputTests(unittest.TestCase):
         reopened = self.repo.reopen_task(task["id"])
         self.assertEqual(reopened["status"], "open")
         self.assertIsNone(reopened["completed_at"])
+
+    def test_commitment_statuses_and_daily_brief(self) -> None:
+        overdue = self.repo.create_task("Send overdue notes", owner="Anish", due_date="2026-05-29")
+        today = self.repo.create_task("Prep launch brief", owner="Anish", due_date="2026-05-31")
+        waiting = self.repo.create_task("Get design approval", owner="Maya", status="waiting")
+        uncertain = self.repo.create_task("Confirm whether beta shipped", status="uncertain")
+        snoozed = self.repo.snooze_task(today["id"], until="2026-06-03")
+        self.repo.cancel_task(uncertain["id"])
+
+        brief = self.repo.daily_brief(today=date(2026, 5, 31))
+
+        self.assertTrue(any(task["id"] == overdue["id"] for task in brief["overdue"]))
+        self.assertTrue(any(task["id"] == waiting["id"] for task in brief["waiting"]))
+        self.assertTrue(any(task["id"] == snoozed["id"] for task in brief["snoozed"]))
+        self.assertFalse(any(task["id"] == uncertain["id"] for task in self.repo.list_commitments()))
+        self.assertEqual(self.repo.get_task(uncertain["id"])["status"], "canceled")
+
+    def test_list_commitments_can_filter_by_person_and_project(self) -> None:
+        self.repo.create_task("Send Alex notes", owner="Anish", owed_to="Alex", project="Onboarding")
+        self.repo.create_task("Review finance doc", owner="Maya", project="Finance")
+
+        alex = self.repo.list_commitments(person="Alex")
+        onboarding = self.repo.list_commitments(project="Onboarding")
+
+        self.assertEqual([task["text"] for task in alex], ["Send Alex notes"])
+        self.assertEqual([task["text"] for task in onboarding], ["Send Alex notes"])
+
+    def test_unprocessed_meetings_detect_missing_outputs(self) -> None:
+        raw = self.repo.create_meeting("Raw Meeting", audio_path="audio/raw.wav")
+        done = self.repo.create_meeting("Done Meeting", audio_path="audio/done.wav")
+        self.repo.update_meeting(
+            done.id,
+            transcript_path="transcripts/done.txt",
+            note_path="notes/done.md",
+            summary="Done",
+            raw_extraction_json="{}",
+        )
+
+        meetings = self.repo.list_unprocessed_meetings()
+
+        self.assertEqual([meeting.id for meeting in meetings], [raw.id])
+        self.assertEqual(self.repo.latest_unprocessed_meeting().id, raw.id)
 
     def test_commitments_markdown_uses_unified_tasks(self) -> None:
         self.repo.create_task("Manual reminder", owner="Anish", due_date="2026-06-01")
@@ -206,6 +248,16 @@ class ExtractionParsingTests(unittest.TestCase):
         self.assertEqual(result.action_items[0].status, "open")
         self.assertEqual(result.commitments[0].text, "Follow up")
         self.assertEqual(result.raw, raw)
+
+    def test_fallback_extract_creates_obvious_action_item(self) -> None:
+        meeting = Meeting(id=1, title="DairyMGT", started_at="2026-06-03T21:18:16+00:00")
+        raw = fallback_extract(meeting, "So, for DairyMGT, we want an email sent to Megan by June 5th.", reason="no key")
+        result = parse_extraction(raw)
+
+        self.assertEqual(raw["provider"], "fallback")
+        self.assertEqual(result.action_items[0].deadline, "June 5th")
+        self.assertIn("send email to megan", result.action_items[0].text.lower())
+        self.assertIn("Megan", result.entities)
 
 
 if __name__ == "__main__":
