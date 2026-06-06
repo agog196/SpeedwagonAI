@@ -14,6 +14,26 @@ Default base URL:
 http://127.0.0.1:8765
 ```
 
+## Local API Auth
+
+V18 protects `/api/*` with a local bearer token. Set `SPEEDWAGON_API_TOKEN` directly, or let Speedwagon create one at `SPEEDWAGON_API_TOKEN_PATH` (`data/local_api_token` by default).
+
+Native/API clients send:
+
+```http
+Authorization: Bearer <local-token>
+```
+
+The browser UI gets a same-site local cookie when `/` is loaded. By default, the API rejects non-loopback host/origin requests unless `SPEEDWAGON_ALLOW_REMOTE_API=true`.
+
+V22 tightens local API failures:
+
+- `400` for malformed JSON, invalid IDs, invalid dates, invalid limits, or missing required fields;
+- `401` for missing or wrong local API token;
+- `403` for disallowed Host/Origin/Referer;
+- `413` for oversized JSON request bodies;
+- `500` remains a generic user-safe message, with redacted details written to local logs.
+
 ## Settings
 
 - `GET /api/settings`
@@ -27,6 +47,33 @@ Useful model fields:
 - `web_model`
 - `model_cost_labels`
 - `web_search_enabled`
+
+## System, Logs, And Privacy
+
+- `GET /api/system/logs`
+- `GET /api/system/privacy-status`
+- `POST /api/system/export`
+- `POST /api/system/wipe`
+
+Export body:
+
+```json
+{
+  "output_path": "data/exports/speedwagon-export.zip"
+}
+```
+
+Wipe body:
+
+```json
+{
+  "confirm": "DELETE-SPEEDWAGON-DATA"
+}
+```
+
+Export creates a local zip with Speedwagon-owned data and a manifest. Wipe refuses to run unless the confirmation string exactly matches `DELETE-SPEEDWAGON-DATA`, then deletes configured local Speedwagon data directories/files and recreates empty directories.
+
+Privacy status is safe for Settings/privacy/debug surfaces. It includes user-visible counts, configured external-service disclosures, local data directory labels, export/wipe availability, and a `path_visibility_note`. It does not return API keys, OAuth tokens, cookies, or bearer tokens.
 
 ## Meetings
 
@@ -64,6 +111,8 @@ Create task body:
 - `POST /api/commitments/{id}/snooze`
 - `POST /api/commitments/{id}/cancel`
 - `GET /api/daily-brief`
+- `GET /api/intelligence/daily?date=YYYY-MM-DD`
+- `POST /api/intelligence/daily/refresh`
 
 Commitment/task statuses:
 
@@ -212,12 +261,22 @@ Sync pulls provider status/transcript into local files. For Recall, Speedwagon r
 ## Context Graph And Suggestions
 
 - `GET /api/context-graph?query=...`
+- `GET /api/contexts/{id}/detail`
 - `GET /api/suggestions`
+- `GET /api/suggestions/{id}`
 - `POST /api/suggestions/{id}/confirm`
 - `POST /api/suggestions/{id}/dismiss`
 - `POST /api/suggestions/{id}/snooze`
 
 The graph layer is local SQLite-backed and deterministic in V13. Tasks, meetings, screenshots, and future integration sources can link to contexts such as projects, people, and topics.
+
+`GET /api/contexts/{id}/detail` is a read-only review endpoint for native person/project/topic panels. It returns `context`, `related_contexts`, `relationships`, `tasks`, `meetings`, `decisions`, `suggestions`, and `followup_drafts`. The endpoint uses existing SQLite graph data only, makes no model calls, and avoids ordinary workflow exposure of local transcript/note paths.
+
+`GET /api/suggestions/{id}` returns the same `suggestion` payload as the list endpoint plus additive detail fields for review surfaces:
+
+- `related_tasks`: task objects already linked to the suggestion;
+- `followup_draft`: existing local or Gmail draft metadata when one has been created;
+- `review_status`: `reviewable`, `accepted`, `dismissed`, `snoozed`, or `retired`.
 
 Context graph response:
 
@@ -227,9 +286,22 @@ Context graph response:
   "contexts": [{ "id": 4, "name": "DairyMGT", "kind": "project" }],
   "tasks": [{ "id": 9, "text": "Email Megan about DairyMGT updates" }],
   "meetings": [],
+  "relationships": [
+    {
+      "id": 2,
+      "source_context": { "id": 5, "name": "Megan", "kind": "person" },
+      "target_context": { "id": 4, "name": "DairyMGT", "kind": "project" },
+      "relationship_type": "owns_followup",
+      "evidence": "Megan owns DairyMGT updates.",
+      "confidence": 0.91,
+      "source_meeting_id": 7
+    }
+  ],
   "suggestions": []
 }
 ```
+
+V20 adds one-hop relationship traversal. A query for a person can include related project/topic contexts and the tasks/meetings linked to those related contexts. Relationship fields are additive and older clients may ignore them.
 
 Suggestion response:
 
@@ -253,6 +325,27 @@ Suggestion response:
 ```
 
 Suggestions remain the action-review surface. V17 adds local notification candidates for native delivery.
+
+Confirming a follow-up/email suggestion creates or reuses a local editable follow-up draft. Confirming an `add_task` suggestion creates or reuses the intended task. Confirmation responses may include `action_result.created`, `action_result.reused`, and `action_result.next_step`; existing `followup_draft` and `task` payloads remain unchanged. Confirmation marks the suggestion accepted only after the action result exists. It does not send email and does not create a Gmail draft until the user explicitly asks.
+
+## Follow-Up Drafts
+
+- `GET /api/email/drafts?status=local`
+- `GET /api/email/drafts/{id}`
+- `POST /api/email/drafts/{id}/update`
+- `POST /api/email/drafts/{id}/gmail-draft`
+
+Update body:
+
+```json
+{
+  "to": "person@example.com",
+  "subject": "Follow-up",
+  "body": "Hi,\n\nEdited local draft.\n"
+}
+```
+
+Create Gmail draft uses the current edited local draft body and requires a recipient. It creates a Gmail draft only; SpeedwagonAI still does not send email.
 
 ## Native Notifications
 
@@ -278,6 +371,8 @@ Notification candidates are suggestion objects with lifecycle fields:
 }
 ```
 
+Native notification payloads include `suggestion_id`. Tapping or reviewing a notification opens the native app to the related suggestion for review; no task/email action runs automatically.
+
 Snooze body:
 
 ```json
@@ -298,7 +393,7 @@ Apple Reminders writes are planned for the native Mac app and require explicit u
 
 ## Google Calendar
 
-Calendar sync is read-only in V16. It reuses the existing Google installed-app OAuth client credentials, keeps a dedicated Calendar token by default, and caches a limited local window for daily brief and meeting-prep context.
+Calendar sync caches a limited local window for daily brief and meeting-prep context. Event creation is supported only through explicit user action; SpeedwagonAI does not edit/delete Calendar events, schedule bots from Calendar, or write reminders.
 
 Install the optional Google client libraries before using real OAuth sync:
 
@@ -309,6 +404,7 @@ pip install -e ".[google]"
 - `GET /api/calendar/status`
 - `POST /api/calendar/sync`
 - `GET /api/calendar/events?from=YYYY-MM-DD&to=YYYY-MM-DD`
+- `POST /api/calendar/events`
 - `GET /api/calendar/upcoming?limit=10`
 
 Status response:
@@ -320,10 +416,12 @@ Status response:
   "credentials_present": true,
   "token_present": true,
   "calendar_scope_present": true,
+  "calendar_write_scope_present": true,
+  "write_enabled": true,
   "calendar_ids": ["primary"],
   "sync_days_back": 14,
   "sync_days_forward": 30,
-  "note": "Google Calendar read-only sync is configured."
+  "note": "Google Calendar sync and explicit event creation are configured."
 }
 ```
 
@@ -335,9 +433,12 @@ Sync response:
   "events": [],
   "calendar_ids": ["primary"],
   "time_min": "2026-05-21T00:00:00Z",
-  "time_max": "2026-07-04T00:00:00Z"
+  "time_max": "2026-07-04T00:00:00Z",
+  "removed_count": 1
 }
 ```
+
+`removed_count` is the number of locally cached events removed because they were no longer present in Google Calendar during the synced window. This keeps local Calendar views aligned after an event is deleted in Google Calendar.
 
 Upcoming response:
 
@@ -356,15 +457,55 @@ Upcoming response:
 }
 ```
 
+Create event request:
+
+```json
+{
+  "title": "Pilot planning",
+  "start_at": "2026-06-08T10:00:00-07:00",
+  "end_at": "2026-06-08T10:30:00-07:00",
+  "timezone": "America/Los_Angeles",
+  "description": "Discuss launch plan",
+  "location": "Google Meet",
+  "attendees": ["alex@example.com"],
+  "send_updates": "none"
+}
+```
+
+Create event response:
+
+```json
+{
+  "status": "created",
+  "provider": "google",
+  "calendar_id": "primary",
+  "event": {
+    "id": 7,
+    "provider_event_id": "google-event-id",
+    "title": "Pilot planning",
+    "start_at": "2026-06-08T10:00:00-07:00",
+    "end_at": "2026-06-08T10:30:00-07:00",
+    "html_link": "https://calendar.google.com/event?eid=..."
+  },
+  "send_updates": "none"
+}
+```
+
 `GET /api/daily-brief` also includes:
 
 - `calendar_today`
 - `calendar_upcoming`
 - `meeting_prep`
+- `notification_candidates`
+- `synthesis`
+
+Daily intelligence is cached and explicit. `GET /api/daily-brief` returns cached synthesis when present and never triggers a model call. `POST /api/intelligence/daily/refresh` builds a compact local snapshot, refreshes one cached synthesis for the requested date, and updates narrative `notification_reason` text for the top notification candidates only.
 
 Meeting prep matches synced event title, description snippet, attendees, and meeting URL against local contexts, meetings, tasks, and suggestions. It does not create tasks, write Calendar events, or schedule bots.
 
-If the configured Calendar token lacks `https://www.googleapis.com/auth/calendar.readonly`, status returns `reauth_required`. Delete or refresh `GOOGLE_CALENDAR_TOKEN_PATH`, then run Calendar sync to authorize the new read-only scope.
+If the configured Calendar token only has the old read-only scope, status returns `configured_read_only` and `write_enabled: false`. Delete or refresh `GOOGLE_CALENDAR_TOKEN_PATH`, then run Calendar sync or create an event to authorize `https://www.googleapis.com/auth/calendar.events`.
+
+Assistant commands can prepare Calendar event creation, for example `create a calendar event for June 10th at 10am to wish a happy birthday to Raj`. This returns a pending confirmation action; the Google Calendar write only runs after the pending action is confirmed.
 
 ## Assistant Actions
 
@@ -496,7 +637,13 @@ Supported deterministic actions:
 - `prep_next_meeting`
 - `search_context`
 - `search_context_graph`
+- `decisions_about_context`
+- `everything_related`
+- `followup_targets`
+- `context_changes`
 - `web_search`
+
+Unsupported command responses may include `suggested_commands` at the top level and in `result.suggested_commands`. Graph-aware answers may include `relationships` and `decisions` in the assistant result.
 
 ## Assistant Voice
 

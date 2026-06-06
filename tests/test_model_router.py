@@ -49,11 +49,28 @@ class ModelRouterTests(unittest.TestCase):
             },
         ):
             self.assertEqual(choose_model(settings, "email_draft").model, "cheap-model")
+            self.assertEqual(choose_model(settings, "relationship_inference").model, "cheap-model")
             self.assertEqual(choose_model(settings, "deep_synthesis").model, "strong-model")
             self.assertEqual(choose_model(settings, "web_search").model, "web-model")
             self.assertEqual(choose_model(settings, "command_parse").model, "command-model")
             self.assertEqual(choose_model(settings, "vision_context").model, "vision-model")
             self.assertTrue(web_search_enabled())
+
+    def test_blank_model_overrides_fall_back_to_configured_default(self) -> None:
+        settings = self.make_settings()
+        blank_settings = Settings(
+            **{**settings.__dict__, "openai_model": ""}
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SPEEDWAGON_MODEL_CHEAP": "",
+                "SPEEDWAGON_MODEL_STRONG": "",
+                "SPEEDWAGON_MODEL_COMMAND": "",
+            },
+        ):
+            self.assertEqual(choose_model(settings, "command_parse").model, "default-mini")
+            self.assertEqual(choose_model(blank_settings, "command_parse").model, "gpt-4.1-mini")
 
 
 if __name__ == "__main__":

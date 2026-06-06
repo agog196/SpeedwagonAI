@@ -26,6 +26,28 @@ class ExtractedItem:
 
 
 @dataclass(frozen=True)
+class ExtractedRelationship:
+    source: str
+    target: str
+    relationship_type: str
+    source_kind: str = "topic"
+    target_kind: str = "topic"
+    evidence: str | None = None
+    confidence: float = 0.7
+
+
+@dataclass(frozen=True)
+class ExtractedFollowup:
+    task_text: str
+    implied_by: str
+    owner: str | None = None
+    owed_to: str | None = None
+    project: str | None = None
+    due_date: str | None = None
+    confidence: float = 0.7
+
+
+@dataclass(frozen=True)
 class ExtractionResult:
     summary: str = ""
     action_items: list[ExtractedItem] = field(default_factory=list)
@@ -34,4 +56,6 @@ class ExtractionResult:
     open_questions: list[str] = field(default_factory=list)
     key_topics: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
+    relationships: list[ExtractedRelationship] = field(default_factory=list)
+    implicit_followups: list[ExtractedFollowup] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)

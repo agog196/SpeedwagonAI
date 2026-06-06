@@ -45,7 +45,18 @@ def parse_date_phrase(value: str) -> str | None:
     }
     month = months[match.group(1)]
     day = int(match.group(2))
-    year = int(match.group(3) or date.today().year)
+    if match.group(3):
+        year = int(match.group(3))
+    else:
+        # Default to current year; if that date already passed, use next year
+        today = date.today()
+        year = today.year
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return None
+        if candidate < today:
+            year += 1
     try:
         parsed = date(year, month, day)
     except ValueError:

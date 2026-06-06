@@ -94,6 +94,21 @@ class CliFlowTests(unittest.TestCase):
                         },
                     ):
                         self.assertEqual(main(["calendar", "sync"]), 0)
+                    self.assertEqual(
+                        main(
+                            [
+                                "calendar",
+                                "create",
+                                "--title",
+                                "No write",
+                                "--start",
+                                "2026-06-08T10:00:00-07:00",
+                                "--end",
+                                "2026-06-08T10:30:00-07:00",
+                            ]
+                        ),
+                        2,
+                    )
 
                     notify_task = repo.create_task("CLI notification task", due_date="2026-06-01")
                     notify_suggestion = next(

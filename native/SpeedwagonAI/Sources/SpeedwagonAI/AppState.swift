@@ -1,4 +1,5 @@
 import Combine
+import AppKit
 import Foundation
 import SpeedwagonAICore
 import UserNotifications
@@ -19,6 +20,12 @@ enum MeetingCaptureMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum AssistantVoicePurpose {
+    case assistant
+    case calendarNaturalLanguage
+    case calendarDescription
+}
+
 func tomorrowISODate() -> String {
     let tomorrow = Calendar(identifier: .gregorian).date(byAdding: .day, value: 1, to: Date()) ?? Date()
     let formatter = DateFormatter()
@@ -32,6 +39,12 @@ func supportsNativeNotifications() -> Bool {
     Bundle.main.bundleURL.pathExtension == "app"
 }
 
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     static let shared = AppState()
@@ -41,14 +54,37 @@ final class AppState: ObservableObject {
     @Published var selectedMeetingDetail: MeetingDetailResponse?
     @Published var commitments: [TaskItem] = []
     @Published var suggestions: [SuggestionItem] = []
+    @Published var followupDrafts: [FollowupDraft] = []
+    @Published var selectedFollowupDraft: FollowupDraft?
+    @Published var draftRecipient = ""
+    @Published var draftSubject = ""
+    @Published var draftBody = ""
+    @Published var highlightedSuggestionId: Int?
+    @Published var suggestionReviewToken = 0
+    @Published var highlightedTaskIds: Set<Int> = []
+    @Published var selectedReviewSuggestion: SuggestionItem?
+    @Published var selectedContextDetail: ContextDetailResponse?
+    @Published var highlightedContextId: Int?
     @Published var notificationStatus: NotificationStatusResponse?
     @Published var notificationCandidates: [SuggestionItem] = []
     @Published var notificationPermissionStatus = "notDetermined"
     @Published var dailyBrief: DailyBriefResponse?
+    @Published var intelligenceStatus: IntelligenceStatusResponse?
+    @Published var isRefreshingIntelligence = false
     @Published var capabilities: [AssistantCapability] = []
     @Published var settings: SettingsResponse?
+    @Published var systemLogs: SystemLogsResponse?
+    @Published var privacyStatus: PrivacyStatusResponse?
     @Published var calendarStatus: CalendarStatusResponse?
     @Published var calendarEvents: [CalendarEvent] = []
+    @Published var calendarCreateTitle = ""
+    @Published var calendarCreateStart = "\(tomorrowISODate())T10:00:00-07:00"
+    @Published var calendarCreateEnd = "\(tomorrowISODate())T10:30:00-07:00"
+    @Published var calendarCreateDescription = ""
+    @Published var calendarCreateLocation = ""
+    @Published var calendarCreateAttendees = ""
+    @Published var calendarCreateSendUpdates = false
+    @Published var calendarNaturalLanguageInput = ""
     @Published var captureStatus: CaptureSession?
     @Published var captureDiagnostics: CaptureDiagnostics?
     @Published var botStatus: BotStatusResponse?
@@ -66,24 +102,48 @@ final class AppState: ObservableObject {
     @Published var commandResponse: AssistantCommandResponse?
     @Published var commandErrorMessage: String?
     @Published var lastVoiceTranscript: String?
+    @Published var assistantVoicePurpose: AssistantVoicePurpose?
     @Published var lastScreenshotPNGData: Data?
     @Published var screenshotAnalysis: ScreenshotAnalysisResponse?
     @Published var isConnected = false
     @Published var isLoading = false
     @Published var statusMessage = "Checking backend..."
+    @Published var backendState: BackendState = .notStarted
+    @Published var backendCommandPreview = ""
+    @Published var backendLogPath = ""
+    @Published var repoRootInput = ""
+    @Published var repoRootDiscoverySource = "not checked"
+    @Published var pythonVersionStatus = PythonVersionStatus.notChecked.displayText
+    @Published var localTokenPresence = "not checked"
+    @Published var openAIKeyPresence = "not checked"
+    @Published var localBetaDiagnosticsReport = ""
+    @Published var openAIAPIKeyInput = ""
+    @Published var exportPathInput = ""
+    @Published var wipeConfirmationInput = ""
 
     let client: SpeedwagonAPIClient
     private let nativeRecorder: NativeMeetingRecording
+    private let backendManager: BackendManager
+    private let keychain: KeychainStore
     private var notificationPollTask: Task<Void, Never>?
     private var scheduledNotificationIds: Set<Int> = []
 
     init(
         client: SpeedwagonAPIClient = SpeedwagonAPIClient(),
-        nativeRecorder: NativeMeetingRecording = ScreenCaptureKitMeetingRecorder()
+        nativeRecorder: NativeMeetingRecording = ScreenCaptureKitMeetingRecorder(),
+        backendManager: BackendManager = BackendManager(),
+        keychain: KeychainStore = .shared
     ) {
         self.client = client
         self.nativeRecorder = nativeRecorder
+        self.backendManager = backendManager
+        self.keychain = keychain
         self.nativeCapturePermissions = nativeRecorder.permissionSnapshot()
+        if let discovery = try? BackendManager.discoverRepoRootDetails() {
+            self.repoRootInput = discovery.path
+            self.repoRootDiscoverySource = discovery.displaySource
+        }
+        self.backendState = backendManager.state
     }
 
     deinit {
@@ -100,6 +160,14 @@ final class AppState: ObservableObject {
 
     var isAssistantVoiceActive: Bool {
         assistantVoiceStatus?.isActive == true || captureStatus?.kind == "assistant_voice"
+    }
+
+    var isCalendarNaturalLanguageVoiceActive: Bool {
+        isAssistantVoiceActive && assistantVoicePurpose == .calendarNaturalLanguage
+    }
+
+    var isCalendarDescriptionVoiceActive: Bool {
+        isAssistantVoiceActive && assistantVoicePurpose == .calendarDescription
     }
 
     var isNativeMeetingCaptureActive: Bool {
@@ -120,107 +188,86 @@ final class AppState: ObservableObject {
             settings = try await client.fetchSettings()
             isConnected = true
         } catch {
-            isConnected = false
-            settings = nil
-            if updateStatus {
-                statusMessage = "Backend disconnected. Start it with: speedwagon app"
+            if await startBackendIfNeeded(updateStatus: updateStatus) {
+                do {
+                    settings = try await client.fetchSettings()
+                    isConnected = true
+                } catch {
+                    isConnected = false
+                    settings = nil
+                    if updateStatus {
+                        statusMessage = "Backend starting failed or is still unavailable: \(error.localizedDescription)"
+                    }
+                    return
+                }
+            } else {
+                isConnected = false
+                settings = nil
+                if updateStatus {
+                    statusMessage = "Backend disconnected. Start it with: speedwagon app"
+                }
+                return
             }
-            return
         }
 
-        do {
-            meetings = try await client.fetchMeetings()
-        } catch {
-            failures.append("meetings")
-        }
+        // Fetch all data in parallel — was sequential, causing ~17 round-trips in series.
+        async let fetchedMeetings = try? client.fetchMeetings()
+        async let fetchedTasks = try? client.fetchTasks()
+        async let fetchedCommitments = try? client.fetchCommitments()
+        async let fetchedBrief = try? client.fetchDailyBrief()
+        async let fetchedCalendarStatus = try? client.fetchCalendarStatus()
+        async let fetchedCalendarEvents = try? client.fetchUpcomingCalendarEvents()
+        async let fetchedCapture = try? client.fetchCaptureStatus()
+        async let fetchedCaptureDiag = try? client.fetchCaptureDiagnostics()
+        async let fetchedBotStatus = try? client.fetchBotStatus()
+        async let fetchedBotSessions = try? client.fetchBotSessions()
+        async let fetchedVoiceStatus = try? client.fetchAssistantVoiceStatus()
+        async let fetchedPendingActions = try? client.fetchPendingActions()
+        async let fetchedSuggestions = try? client.fetchSuggestions()
+        async let fetchedDrafts = try? client.fetchFollowupDrafts()
+        async let fetchedLogs = try? client.fetchSystemLogs()
+        async let fetchedPrivacy = try? client.fetchPrivacyStatus()
+        async let fetchedNotifStatus = try? client.fetchNotificationStatus()
+        async let fetchedNotifCandidates = try? client.fetchNotificationCandidates()
 
-        do {
-            tasks = try await client.fetchTasks()
-        } catch {
-            failures.append("tasks")
-        }
+        let (m, t, c, b, cs, ce, cap, cd, bs, bss, av, pa, sg, dr, sl, pv, ns, nc) = await (
+            fetchedMeetings, fetchedTasks, fetchedCommitments, fetchedBrief,
+            fetchedCalendarStatus, fetchedCalendarEvents,
+            fetchedCapture, fetchedCaptureDiag,
+            fetchedBotStatus, fetchedBotSessions, fetchedVoiceStatus,
+            fetchedPendingActions, fetchedSuggestions, fetchedDrafts,
+            fetchedLogs, fetchedPrivacy, fetchedNotifStatus, fetchedNotifCandidates
+        )
 
-        do {
-            commitments = try await client.fetchCommitments()
-        } catch {
-            failures.append("commitments")
-        }
-
-        do {
-            dailyBrief = try await client.fetchDailyBrief()
-        } catch {
-            failures.append("daily brief")
-        }
-
-        do {
-            calendarStatus = try await client.fetchCalendarStatus()
-        } catch {
-            failures.append("calendar status")
-        }
-
-        do {
-            calendarEvents = try await client.fetchUpcomingCalendarEvents()
-        } catch {
-            failures.append("calendar")
-        }
-
-        do {
-            capabilities = try await client.fetchCapabilities()
-        } catch {
-            failures.append("capabilities")
-        }
-
-        do {
-            captureStatus = try await client.fetchCaptureStatus()
-        } catch {
-            failures.append("capture")
-        }
-
-        do {
-            captureDiagnostics = try await client.fetchCaptureDiagnostics()
-            nativeCapturePermissions = nativeRecorder.permissionSnapshot()
-        } catch {
-            failures.append("diagnostics")
-        }
-
-        do {
-            botStatus = try await client.fetchBotStatus()
-        } catch {
-            failures.append("bot status")
-        }
-
-        do {
-            botSessions = try await client.fetchBotSessions()
-        } catch {
-            failures.append("bot sessions")
-        }
-
-        do {
-            assistantVoiceStatus = try await client.fetchAssistantVoiceStatus()
-        } catch {
-            failures.append("voice")
-        }
-
-        do {
-            pendingActions = try await client.fetchPendingActions()
-        } catch {
-            failures.append("pending actions")
-        }
-
-        do {
-            suggestions = try await client.fetchSuggestions()
-        } catch {
-            failures.append("suggestions")
-        }
-
-        do {
-            notificationStatus = try await client.fetchNotificationStatus()
-            notificationCandidates = try await client.fetchNotificationCandidates()
+        if let m { meetings = m } else { failures.append("meetings") }
+        if let t { tasks = t } else { failures.append("tasks") }
+        if let c { commitments = c } else { failures.append("commitments") }
+        if let b {
+            dailyBrief = b
+            intelligenceStatus = try? await client.fetchIntelligenceStatus(date: b.date)
+        } else { failures.append("daily brief") }
+        if let cs { calendarStatus = cs } else { failures.append("calendar status") }
+        if let ce { calendarEvents = ce } else { failures.append("calendar") }
+        if let cap { captureStatus = cap } else { failures.append("capture") }
+        if let cd { captureDiagnostics = cd; nativeCapturePermissions = nativeRecorder.permissionSnapshot() } else { failures.append("diagnostics") }
+        if let bs { botStatus = bs } else { failures.append("bot status") }
+        if let bss { botSessions = bss } else { failures.append("bot sessions") }
+        if let av { assistantVoiceStatus = av } else { failures.append("voice") }
+        if let pa { pendingActions = pa } else { failures.append("pending actions") }
+        if let sg { suggestions = sg } else { failures.append("suggestions") }
+        if let dr { followupDrafts = dr } else { failures.append("drafts") }
+        if let sl {
+            systemLogs = sl
+            backendLogPath = sl.backendLogPath.isEmpty ? (settings?.backendLogPath ?? "") : sl.backendLogPath
+        } else { failures.append("system") }
+        if let pv { privacyStatus = pv }
+        if let ns { notificationStatus = ns }
+        if let nc {
+            notificationCandidates = nc
+            suggestions = Self.mergeSuggestions(suggestions, with: nc)
             await refreshNotificationPermissionStatus()
             await scheduleNotificationCandidates()
-        } catch {
-            failures.append("notifications")
-        }
+        } else { failures.append("notifications") }
 
         if updateStatus {
             if failures.isEmpty {
@@ -228,6 +275,131 @@ final class AppState: ObservableObject {
             } else {
                 statusMessage = "Connected. Could not refresh: \(failures.joined(separator: ", "))."
             }
+        }
+    }
+
+    func startBackendIfNeeded(updateStatus: Bool = true) async -> Bool {
+        do {
+            let config = try backendManager.makeConfiguration(repoRoot: repoRootInput.isEmpty ? nil : repoRootInput, keychain: keychain)
+            backendCommandPreview = config.commandPreview
+            backendLogPath = config.logPath
+            try backendManager.start(configuration: config)
+            backendState = backendManager.state
+            if updateStatus {
+                statusMessage = "Starting local backend..."
+            }
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            return true
+        } catch {
+            backendState = backendManager.state
+            statusMessage = "Could not start backend: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func stopManagedBackend() {
+        backendManager.stop()
+        backendState = backendManager.state
+        statusMessage = "Stopped managed backend."
+    }
+
+    func saveCoreSecrets() async {
+        do {
+            if !openAIAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try keychain.save(openAIAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines), account: KeychainAccount.openAIAPIKey)
+            }
+            _ = try keychain.ensureLocalAPIToken()
+            statusMessage = "Saved local beta secrets."
+        } catch {
+            statusMessage = "Could not save secrets: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshLocalBetaDiagnostics() async {
+        if let discovery = try? BackendManager.discoverRepoRootDetails() {
+            repoRootInput = repoRootInput.isEmpty ? discovery.path : repoRootInput
+            repoRootDiscoverySource = discovery.displaySource
+        } else {
+            repoRootDiscoverySource = "missing"
+        }
+        let executable = backendCommandPreview.split(separator: " ").first.map(String.init) ?? "python3.11"
+        pythonVersionStatus = await runPythonVersionCheck(executable: executable).displayText
+        let localToken = try? keychain.load(account: KeychainAccount.localAPIToken)
+        let openAIKey = try? keychain.load(account: KeychainAccount.openAIAPIKey)
+        localTokenPresence = (localToken?.isEmpty == false) ? "present" : "missing"
+        openAIKeyPresence = (openAIKey?.isEmpty == false) ? "present" : "missing"
+        localBetaDiagnosticsReport = LocalBetaDiagnostics.report(
+            input: diagnosticsInput(
+                localTokenPresent: localToken?.isEmpty == false,
+                openAIKeyPresent: openAIKey?.isEmpty == false
+            ),
+            secrets: [localToken, openAIKey].compactMap { $0 }
+        )
+        statusMessage = "Refreshed local beta diagnostics."
+    }
+
+    func copyLocalBetaDiagnosticsReport() async {
+        await refreshLocalBetaDiagnostics()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(localBetaDiagnosticsReport, forType: .string)
+        statusMessage = "Copied redacted local beta diagnostics."
+    }
+
+    private func diagnosticsInput(localTokenPresent: Bool, openAIKeyPresent: Bool) -> LocalBetaDiagnosticsInput {
+        LocalBetaDiagnosticsInput(
+            repoRoot: repoRootInput,
+            repoRootSource: repoRootDiscoverySource,
+            backendState: backendState.rawValue,
+            backendCommand: backendCommandPreview,
+            pythonExecutable: backendCommandPreview.split(separator: " ").first.map(String.init) ?? "python3.11",
+            pythonVersion: pythonVersionStatus,
+            backendLogPath: backendLogPath,
+            localTokenPresent: localTokenPresent,
+            openAIKeyPresent: openAIKeyPresent,
+            bundleMode: BundleMode.from(bundlePathExtension: Bundle.main.bundleURL.pathExtension).displayText,
+            notificationPermission: notificationPermissionStatus
+        )
+    }
+
+    private nonisolated func runPythonVersionCheck(executable: String) async -> PythonVersionStatus {
+        await Task.detached {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [executable] + PythonVersionProbe.arguments()
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                return PythonVersionProbe.parse(output: output, terminationStatus: process.terminationStatus)
+            } catch {
+                return .unavailable(error.localizedDescription)
+            }
+        }.value
+    }
+
+    func exportLocalData() async {
+        do {
+            let output = exportPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            let result = try await client.exportData(outputPath: output.isEmpty ? nil : output)
+            statusMessage = "Exported \(result.fileCount) files to \(result.path)."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not export data: \(error.localizedDescription)"
+        }
+    }
+
+    func wipeLocalData() async {
+        do {
+            let result = try await client.wipeData(confirm: wipeConfirmationInput)
+            wipeConfirmationInput = ""
+            statusMessage = "Wiped local data paths: \(result.removed.count)."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not wipe data: \(error.localizedDescription)"
         }
     }
 
@@ -250,7 +422,9 @@ final class AppState: ObservableObject {
             commandResponse = response
             isConnected = true
             commandText = ""
-            await refreshAll(updateStatus: false)
+            if Self.isMutatingAction(response.action) {
+                await refreshAll(updateStatus: false)
+            }
             statusMessage = response.supported ? "Command finished." : "Command not supported."
         } catch {
             commandErrorMessage = error.localizedDescription
@@ -261,6 +435,46 @@ final class AppState: ObservableObject {
                 command: command
             )
             statusMessage = "Command failed."
+        }
+    }
+
+    func runSuggestedCommand(_ command: String) async {
+        commandText = command
+        await runCommand()
+    }
+
+    func clearConversation() {
+        commandResponse = nil
+        commandErrorMessage = nil
+        lastVoiceTranscript = nil
+        screenshotAnalysis = nil
+        commandText = ""
+    }
+
+    private static let mutatingActions: Set<String> = [
+        "add_task", "complete_task", "reopen_task", "snooze_task", "cancel_task",
+        "mark_task_waiting", "mark_task_uncertain",
+        "confirm_suggestion", "dismiss_suggestion", "snooze_suggestion",
+        "process_meeting", "process_latest_meeting",
+        "start_meeting_recording", "finish_meeting_recording", "stop_meeting_recording",
+        "join_meeting_bot", "sync_bot_session", "process_bot_session",
+        "create_calendar_event", "sync_calendar",
+        "draft_meeting_followup", "draft_followup", "draft_email_from_context", "create_local_email_draft",
+    ]
+
+    static func isMutatingAction(_ action: String?) -> Bool {
+        guard let action else { return false }
+        return mutatingActions.contains(action)
+    }
+
+    func stopActiveAssistantVoiceFromComposer() async {
+        switch assistantVoicePurpose {
+        case .calendarNaturalLanguage:
+            await stopCalendarNaturalLanguageVoice()
+        case .calendarDescription:
+            await stopCalendarDescriptionVoice()
+        default:
+            await stopAssistantVoice()
         }
     }
 
@@ -372,7 +586,10 @@ final class AppState: ObservableObject {
 
     func complete(_ task: TaskItem) async {
         do {
-            _ = try await client.completeTask(id: task.id)
+            let completed = try await client.completeTask(id: task.id)
+            if let index = tasks.firstIndex(where: { $0.id == completed.id }) {
+                tasks[index] = completed
+            }
             await refreshAll()
         } catch {
             statusMessage = "Could not complete task \(task.id)."
@@ -388,6 +605,19 @@ final class AppState: ObservableObject {
         }
     }
 
+    func clearDoneTasks() async {
+        do {
+            let response = try await client.clearDoneTasks()
+            tasks.removeAll { $0.status == "done" }
+            statusMessage = response.cleared == 1
+                ? "Cleared 1 completed task."
+                : "Cleared \(response.cleared) completed tasks."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not clear completed tasks: \(error.localizedDescription)"
+        }
+    }
+
     func loadMeeting(_ meeting: MeetingItem) async {
         do {
             selectedMeetingDetail = try await client.fetchMeetingDetail(id: meeting.id)
@@ -395,6 +625,70 @@ final class AppState: ObservableObject {
         } catch {
             statusMessage = "Could not load meeting \(meeting.id): \(error.localizedDescription)"
         }
+    }
+
+    func loadContextDetail(_ context: ContextItem) async {
+        await loadContextDetail(id: context.id, name: context.name)
+    }
+
+    func loadContextDetail(id: Int, name: String? = nil) async {
+        do {
+            selectedContextDetail = try await client.fetchContextDetail(id: id)
+            highlightedContextId = id
+            statusMessage = "Loaded review for \(selectedContextDetail?.context.name ?? name ?? "context #\(id)")."
+        } catch {
+            statusMessage = "Could not load context \(name ?? "#\(id)"): \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func createContext(name: String, kind: String = "person") async -> ContextDetailResponse? {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            statusMessage = "Person name is required."
+            return nil
+        }
+        do {
+            let detail = try await client.createContext(request: ContextCreateRequest(name: trimmedName, kind: kind))
+            selectedContextDetail = detail
+            highlightedContextId = detail.context.id
+            statusMessage = "Added \(detail.context.name)."
+            return detail
+        } catch {
+            statusMessage = "Could not add person: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    @discardableResult
+    func saveContextProfile(id: Int, email: String, phone: String, role: String, company: String, notes: String) async -> Bool {
+        do {
+            selectedContextDetail = try await client.updateContextProfile(
+                id: id,
+                request: ContextProfileUpdateRequest(
+                    email: email.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    phone: phone.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    role: role.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    company: company.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                )
+            )
+            highlightedContextId = id
+            statusMessage = "Saved profile for \(selectedContextDetail?.context.name ?? "context #\(id)")."
+            return true
+        } catch {
+            statusMessage = "Could not save profile: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func clearContextSelection() {
+        selectedContextDetail = nil
+        highlightedContextId = nil
+    }
+
+    func clearMeetingSelection() {
+        selectedMeetingDetail = nil
     }
 
     func processMeeting(_ meeting: MeetingItem) async {
@@ -511,14 +805,30 @@ final class AppState: ObservableObject {
         }
     }
 
-    func startAssistantVoice() async {
+    func startAssistantVoice(purpose: AssistantVoicePurpose = .assistant) async {
         do {
             assistantVoiceStatus = try await client.startAssistantVoice()
             captureStatus = assistantVoiceStatus
-            statusMessage = "Recording assistant voice message."
+            assistantVoicePurpose = purpose
+            switch purpose {
+            case .assistant:
+                statusMessage = "Recording assistant voice message."
+            case .calendarNaturalLanguage:
+                statusMessage = "Recording calendar event description."
+            case .calendarDescription:
+                statusMessage = "Recording Calendar event notes."
+            }
         } catch {
             statusMessage = "Could not start assistant voice: \(error.localizedDescription)"
         }
+    }
+
+    func startCalendarNaturalLanguageVoice() async {
+        await startAssistantVoice(purpose: .calendarNaturalLanguage)
+    }
+
+    func startCalendarDescriptionVoice() async {
+        await startAssistantVoice(purpose: .calendarDescription)
     }
 
     func joinBotSession() async {
@@ -561,13 +871,138 @@ final class AppState: ObservableObject {
         }
     }
 
+    func clearBotSessions() async {
+        do {
+            let response = try await client.clearBotSessions()
+            botSessions = response.sessions
+            statusMessage = response.clearedCount == 1 ? "Cleared 1 bot session." : "Cleared \(response.clearedCount) bot sessions."
+        } catch {
+            statusMessage = "Could not clear bot sessions: \(error.localizedDescription)"
+        }
+    }
+
     func syncCalendar() async {
         do {
             let response = try await client.syncCalendar()
-            statusMessage = "Synced \(response.syncedCount) calendar events."
+            if let removed = response.removedCount, removed > 0 {
+                statusMessage = "Synced \(response.syncedCount) calendar events and removed \(removed) deleted event(s)."
+            } else {
+                statusMessage = "Synced \(response.syncedCount) calendar events."
+            }
             await refreshAll(updateStatus: false)
         } catch {
             statusMessage = "Could not sync calendar: \(error.localizedDescription)"
+        }
+    }
+
+    func createCalendarEvent() async {
+        let title = calendarCreateTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            statusMessage = "Calendar event title is required."
+            return
+        }
+        do {
+            let request = CalendarCreateEventRequest(
+                title: title,
+                startAt: calendarCreateStart.trimmingCharacters(in: .whitespacesAndNewlines),
+                endAt: calendarCreateEnd.trimmingCharacters(in: .whitespacesAndNewlines),
+                calendarId: calendarStatus?.calendarIds?.first ?? "primary",
+                timezone: TimeZone.current.identifier,
+                description: calendarCreateDescription.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                location: calendarCreateLocation.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                attendees: calendarCreateAttendees
+                    .split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == ";" })
+                    .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty },
+                sendUpdates: calendarCreateSendUpdates ? "all" : "none"
+            )
+            let response = try await client.createCalendarEvent(request)
+            calendarEvents.insert(response.event, at: 0)
+            calendarCreateTitle = ""
+            calendarCreateDescription = ""
+            calendarCreateLocation = ""
+            calendarCreateAttendees = ""
+            statusMessage = response.htmlLink?.isEmpty == false
+                ? "Created Google Calendar event. Review it in Google Calendar."
+                : "Created Google Calendar event."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not create calendar event: \(error.localizedDescription)"
+        }
+    }
+
+    func runCalendarNaturalLanguageInput() async {
+        let command = calendarNaturalLanguageInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else { return }
+        calendarNaturalLanguageInput = ""
+        commandText = command
+        await runCommand()
+    }
+
+    func stopCalendarNaturalLanguageVoice() async {
+        do {
+            let response = try await client.stopAssistantVoice()
+            lastVoiceTranscript = response.transcript
+            calendarNaturalLanguageInput = response.transcript
+            commandResponse = response.assistantResponse
+            assistantVoicePurpose = nil
+            assistantVoiceStatus = response.session
+            captureStatus = response.session
+            statusMessage = response.assistantResponse.requiresConfirmation == true
+                ? "Calendar event prepared. Review the pending confirmation."
+                : "Calendar voice message finished."
+            await refreshAll(updateStatus: false)
+        } catch {
+            assistantVoicePurpose = nil
+            commandErrorMessage = error.localizedDescription
+            commandResponse = AssistantCommandResponse(
+                supported: false,
+                category: "system_status",
+                summary: "Calendar voice input failed: \(error.localizedDescription)",
+                result: nil
+            )
+            statusMessage = "Calendar voice input failed."
+        }
+    }
+
+    func stopCalendarDescriptionVoice() async {
+        do {
+            let response = try await client.transcribeAssistantVoice()
+            lastVoiceTranscript = response.transcript
+            let transcript = response.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !transcript.isEmpty {
+                let existing = calendarCreateDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                calendarCreateDescription = existing.isEmpty ? transcript : "\(existing)\n\(transcript)"
+            }
+            assistantVoicePurpose = nil
+            assistantVoiceStatus = response.session
+            captureStatus = response.session
+            statusMessage = "Added voice notes to the Calendar description."
+            await refreshAll(updateStatus: false)
+        } catch {
+            assistantVoicePurpose = nil
+            commandErrorMessage = error.localizedDescription
+            statusMessage = "Calendar description dictation failed: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshDailyIntelligence() async {
+        guard !isRefreshingIntelligence else { return }
+        isRefreshingIntelligence = true
+        defer { isRefreshingIntelligence = false }
+        do {
+            let response = try await client.refreshDailyIntelligence(date: dailyBrief?.date, topSuggestionLimit: 8)
+            intelligenceStatus = IntelligenceStatusResponse(
+                date: response.date,
+                cached: response.synthesis,
+                latest: response.synthesis,
+                manualRefreshRequired: true,
+                note: "Daily intelligence is generated only when explicitly refreshed."
+            )
+            statusMessage = "Refreshed daily intelligence for \(response.date)."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not refresh daily intelligence: \(error.localizedDescription)"
         }
     }
 
@@ -604,6 +1039,7 @@ final class AppState: ObservableObject {
         do {
             notificationStatus = try await client.fetchNotificationStatus()
             notificationCandidates = try await client.fetchNotificationCandidates()
+            suggestions = Self.mergeSuggestions(suggestions, with: notificationCandidates)
             await refreshNotificationPermissionStatus()
             await scheduleNotificationCandidates()
         } catch {
@@ -702,9 +1138,13 @@ final class AppState: ObservableObject {
             let response = try await client.stopAssistantVoice()
             lastVoiceTranscript = response.transcript
             commandResponse = response.assistantResponse
+            assistantVoicePurpose = nil
+            assistantVoiceStatus = response.session
+            captureStatus = response.session
             statusMessage = response.assistantResponse.supported ? "Voice command finished." : "Voice command not supported."
             await refreshAll(updateStatus: false)
         } catch {
+            assistantVoicePurpose = nil
             commandErrorMessage = error.localizedDescription
             commandResponse = AssistantCommandResponse(
                 supported: false,
@@ -765,6 +1205,13 @@ final class AppState: ObservableObject {
             let response = try await client.confirmPendingAction(id: action.id)
             commandResponse = response
             statusMessage = response.summary
+            if let draft = response.result?.followupDraft {
+                if !followupDrafts.contains(where: { $0.id == draft.id }) {
+                    followupDrafts.insert(draft, at: 0)
+                }
+                selectFollowupDraft(draft)
+                statusMessage = "Created local draft \(draft.id). Review it before creating it in Gmail."
+            }
             await refreshAll(updateStatus: false)
         } catch {
             statusMessage = "Could not confirm action \(action.id): \(error.localizedDescription)"
@@ -784,12 +1231,207 @@ final class AppState: ObservableObject {
 
     func confirm(_ suggestion: SuggestionItem) async {
         do {
-            let updated = try await client.confirmSuggestion(id: suggestion.id)
-            statusMessage = "Accepted suggestion \(updated.id)."
-            await refreshAll(updateStatus: false)
+            let response = try await client.confirmSuggestionEnvelope(id: suggestion.id)
+            upsertSuggestion(response.suggestion)
+            selectedReviewSuggestion = response.suggestion
+            highlightedSuggestionId = response.suggestion.id
+            if let draft = response.actionResult?.followupDraft {
+                selectFollowupDraft(draft)
+                statusMessage = response.actionResult?.nextStep ?? "Accepted suggestion \(response.suggestion.id). Review the draft before creating it in Gmail."
+            } else if response.actionResult?.task != nil {
+                statusMessage = response.actionResult?.nextStep ?? "Accepted suggestion \(response.suggestion.id). Review the task."
+            } else {
+                statusMessage = response.actionResult?.nextStep ?? "Accepted suggestion \(response.suggestion.id)."
+            }
+            await refreshSuggestionState()
         } catch {
             statusMessage = "Could not accept suggestion \(suggestion.id): \(error.localizedDescription)"
         }
+    }
+
+    func clearReviewedSuggestions() async {
+        do {
+            let response = try await client.clearReviewedSuggestions()
+            suggestions.removeAll { ["accepted", "dismissed", "retired"].contains($0.status) }
+            if let selected = selectedReviewSuggestion,
+               ["accepted", "dismissed", "retired"].contains(selected.status) {
+                selectedReviewSuggestion = nil
+            }
+            statusMessage = response.cleared == 1
+                ? "Cleared 1 reviewed suggestion."
+                : "Cleared \(response.cleared) reviewed suggestions."
+            await refreshSuggestionState()
+        } catch {
+            statusMessage = "Could not clear reviewed suggestions: \(error.localizedDescription)"
+        }
+    }
+
+    func clearSuggestionSelection() {
+        highlightedSuggestionId = nil
+        highlightedTaskIds = []
+        selectedReviewSuggestion = nil
+        clearSelectedFollowupDraft()
+    }
+
+    private func upsertSuggestion(_ suggestion: SuggestionItem) {
+        if let index = suggestions.firstIndex(where: { $0.id == suggestion.id }) {
+            suggestions[index] = suggestion
+        } else {
+            suggestions.insert(suggestion, at: 0)
+        }
+    }
+
+    func refreshSuggestionState() async {
+        do {
+            async let fetchedSuggestions = client.fetchSuggestions()
+            async let fetchedDrafts = client.fetchFollowupDrafts()
+            async let fetchedCandidates = try? client.fetchNotificationCandidates()
+            suggestions = try await fetchedSuggestions
+            followupDrafts = try await fetchedDrafts
+            if let candidates = await fetchedCandidates {
+                notificationCandidates = candidates
+                suggestions = Self.mergeSuggestions(suggestions, with: candidates)
+            }
+        } catch {
+            statusMessage = "Could not refresh suggestions: \(error.localizedDescription)"
+        }
+    }
+
+    private static func mergeSuggestions(_ base: [SuggestionItem], with candidates: [SuggestionItem]) -> [SuggestionItem] {
+        var merged = base
+        var existing = Set(base.map(\.id))
+        for candidate in candidates where !existing.contains(candidate.id) {
+            merged.insert(candidate, at: 0)
+            existing.insert(candidate.id)
+        }
+        return merged
+    }
+
+    func selectFollowupDraft(_ draft: FollowupDraft) {
+        selectedFollowupDraft = draft
+        draftRecipient = draft.recipient ?? ""
+        draftSubject = draft.subject
+        draftBody = draft.body
+    }
+
+    func clearSelectedFollowupDraft() {
+        selectedFollowupDraft = nil
+        draftRecipient = ""
+        draftSubject = ""
+        draftBody = ""
+    }
+
+    func saveSelectedFollowupDraft() async {
+        guard let draft = selectedFollowupDraft else { return }
+        do {
+            let updated = try await client.updateFollowupDraft(
+                id: draft.id,
+                to: draftRecipient,
+                subject: draftSubject,
+                body: draftBody
+            )
+            selectFollowupDraft(updated)
+            statusMessage = "Saved local draft \(updated.id)."
+            await refreshAll(updateStatus: false)
+        } catch {
+            statusMessage = "Could not save draft \(draft.id): \(error.localizedDescription)"
+        }
+    }
+
+    func createGmailDraftFromSelectedFollowupDraft() async {
+        guard let draft = selectedFollowupDraft else { return }
+        do {
+            let envelope = try await client.createGmailDraftFromFollowupDraft(
+                id: draft.id,
+                to: draftRecipient,
+                subject: draftSubject,
+                body: draftBody
+            )
+            selectFollowupDraft(envelope.draft)
+            let draftId = envelope.draftId ?? envelope.draft.providerDraftId ?? ""
+            statusMessage = draftId.isEmpty
+                ? "Gmail draft created. Review it in Gmail before sending."
+                : "Gmail draft created (\(draftId)). Review it in Gmail before sending."
+            await refreshSuggestionState()
+        } catch {
+            statusMessage = "Could not create Gmail draft from draft \(draft.id): \(error.localizedDescription)"
+        }
+    }
+
+    func openSuggestionFromNotification(id: Int) async {
+        highlightedSuggestionId = id
+        suggestionReviewToken += 1
+        highlightedTaskIds = []
+        if selectedFollowupDraft?.suggestionId != id {
+            clearSelectedFollowupDraft()
+        }
+        await refreshAll(updateStatus: false)
+        if let draft = followupDrafts.first(where: { $0.suggestionId == id }) {
+            selectFollowupDraft(draft)
+        }
+        if let suggestion = suggestions.first(where: { $0.id == id }) ?? notificationCandidates.first(where: { $0.id == id }) {
+            upsertSuggestion(suggestion)
+            selectedReviewSuggestion = suggestion
+            highlightedTaskIds = Set(suggestion.taskIds)
+            if selectedFollowupDraft?.suggestionId != id,
+               let envelope = try? await client.fetchSuggestionEnvelope(id: id) {
+                upsertSuggestion(envelope.suggestion)
+                selectedReviewSuggestion = envelope.suggestion
+                if let draft = envelope.followupDraft {
+                    if !followupDrafts.contains(where: { $0.id == draft.id }) {
+                        followupDrafts.insert(draft, at: 0)
+                    }
+                    selectFollowupDraft(draft)
+                }
+                if let relatedTasks = envelope.relatedTasks, !relatedTasks.isEmpty {
+                    highlightedTaskIds = Set(relatedTasks.map(\.id))
+                }
+            }
+            statusMessage = reviewMessage(for: suggestion, draftSelected: selectedFollowupDraft?.suggestionId == id)
+            return
+        }
+        do {
+            let envelope = try await client.fetchSuggestionEnvelope(id: id)
+            upsertSuggestion(envelope.suggestion)
+            selectedReviewSuggestion = envelope.suggestion
+            if let relatedTasks = envelope.relatedTasks, !relatedTasks.isEmpty {
+                highlightedTaskIds = Set(relatedTasks.map(\.id))
+            } else {
+                highlightedTaskIds = Set(envelope.suggestion.taskIds)
+            }
+            if let draft = envelope.followupDraft {
+                if !followupDrafts.contains(where: { $0.id == draft.id }) {
+                    followupDrafts.insert(draft, at: 0)
+                }
+                selectFollowupDraft(draft)
+            } else if let drafts = try? await client.fetchFollowupDrafts(status: "", limit: 100),
+                      let match = drafts.first(where: { $0.suggestionId == id }) {
+                followupDrafts = drafts
+                selectFollowupDraft(match)
+            }
+            statusMessage = reviewMessage(for: envelope.suggestion, draftSelected: selectedFollowupDraft?.suggestionId == id)
+        } catch {
+            statusMessage = "Could not load suggestion \(id): \(error.localizedDescription)"
+        }
+    }
+
+    private func reviewMessage(for suggestion: SuggestionItem, draftSelected: Bool) -> String {
+        if suggestion.status == "dismissed" || suggestion.status == "retired" || suggestion.retiredAt != nil {
+            return "Suggestion \(suggestion.id) is \(suggestion.status)."
+        }
+        if suggestion.status == "snoozed" {
+            return "Suggestion \(suggestion.id) is snoozed. Review before taking action."
+        }
+        if draftSelected {
+            return "Reviewing suggestion \(suggestion.id) with its local draft selected."
+        }
+        if suggestion.taskIds.count == 1 {
+            return "Reviewing suggestion \(suggestion.id) and highlighted task \(suggestion.taskIds[0])."
+        }
+        if suggestion.taskIds.count > 1 {
+            return "Reviewing suggestion \(suggestion.id) with \(suggestion.taskIds.count) related tasks."
+        }
+        return "Reviewing suggestion \(suggestion.id)."
     }
 
     func dismiss(_ suggestion: SuggestionItem) async {

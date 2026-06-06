@@ -6,13 +6,14 @@ import threading
 import unittest
 import urllib.request
 import urllib.error
+import zipfile
 from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 from speedwagon_ai.app import make_handler
-from speedwagon_ai.config import Settings
+from speedwagon_ai.config import Settings, local_api_token
 from speedwagon_ai.models import ExtractionResult, ExtractedItem
 from speedwagon_ai.meeting_bot import FakeMeetingBotProvider
 from speedwagon_ai.screenshot_context import build_analysis_response
@@ -46,6 +47,7 @@ class AppApiTests(unittest.TestCase):
         )
         self.repo = Repository(self.settings.db_path)
         self.repo.init()
+        self.api_token = local_api_token(self.settings)
         meeting = self.repo.create_meeting("API Meeting")
         self.repo.save_extraction(
             meeting.id,
@@ -78,6 +80,55 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(detail["meeting"]["summary"], "API test summary.")
         self.assertEqual(detail["decisions"][0]["text"], "Use local HTTP API")
 
+    def test_api_requires_local_token(self) -> None:
+        request = urllib.request.Request(f"{self.base_url}/api/settings")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(raised.exception.code, 401)
+
+        request = urllib.request.Request(f"{self.base_url}/api/settings", headers={"Authorization": "Bearer wrong"})
+        with self.assertRaises(urllib.error.HTTPError) as wrong:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(wrong.exception.code, 401)
+
+    def test_api_rejects_remote_host_and_origin(self) -> None:
+        request = urllib.request.Request(
+            f"{self.base_url}/api/settings",
+            headers={"Authorization": f"Bearer {self.api_token}", "Host": "192.168.1.10"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as bad_host:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(bad_host.exception.code, 403)
+
+        request = urllib.request.Request(
+            f"{self.base_url}/api/settings",
+            headers={"Authorization": f"Bearer {self.api_token}", "Origin": "https://example.com"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as bad_origin:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(bad_origin.exception.code, 403)
+
+    def test_api_rejects_invalid_requests(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as bad_limit:
+            self.get_json("/api/meetings?limit=not-a-number")
+        self.assertEqual(bad_limit.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as bad_id:
+            self.post_json("/api/tasks/not-a-number/complete", {})
+        self.assertEqual(bad_id.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as bad_date:
+            self.post_json("/api/intelligence/daily/refresh", {"date": "tomorrow"})
+        self.assertEqual(bad_date.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as malformed:
+            self.post_raw("/api/tasks", b"{not json", "application/json")
+        self.assertEqual(malformed.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as too_large:
+            self.post_raw("/api/tasks", json.dumps({"text": "x" * 1_000_001}).encode("utf-8"), "application/json")
+        self.assertEqual(too_large.exception.code, 413)
+
     def test_email_preview_api(self) -> None:
         preview = self.post_json(
             "/api/meetings/1/email/preview",
@@ -99,7 +150,10 @@ class AppApiTests(unittest.TestCase):
                 },
             )
         self.assertEqual(response["draft_id"], "draft-1")
-        self.assertEqual(create_draft.call_args.kwargs["body"], "Hi,\n\nThis is the edited body.\n\nThanks,")
+        self.assertEqual(
+            create_draft.call_args.kwargs["body"],
+            "Hi,\n\nThis is the edited body.\n\nThanks,\nAnish Gogineni",
+        )
 
     def test_context_and_settings_api(self) -> None:
         context = self.get_json("/api/context?topic=API")
@@ -108,6 +162,61 @@ class AppApiTests(unittest.TestCase):
         settings = self.get_json("/api/settings")
         self.assertFalse(settings["openai_key_present"])
         self.assertIn("recorder_status", settings)
+        self.assertIn("app_log_path", settings)
+
+    def test_system_export_wipe_and_logs_api(self) -> None:
+        self.settings.notes_dir.mkdir(parents=True, exist_ok=True)
+        note_path = self.settings.notes_dir / "note.md"
+        note_path.write_text("private note", encoding="utf-8")
+        output_path = Path(self.tmp.name) / "speedwagon-export.zip"
+
+        privacy = self.get_json("/api/system/privacy-status")
+        self.assertTrue(privacy["export_supported"])
+        self.assertEqual(privacy["wipe_confirmation"], "DELETE-SPEEDWAGON-DATA")
+        self.assertIn("Detailed local paths are limited", privacy["path_visibility_note"])
+        self.assertIn("external_services", privacy)
+        self.assertIn("data_disclosures", privacy)
+        self.assertIn("local_data_dirs", privacy)
+        self.assertFalse(privacy["external_services"]["openai"]["configured"])
+        self.assertTrue(any(item["service"] == "OpenAI" for item in privacy["data_disclosures"]))
+        self.assertNotIn(self.api_token, json.dumps(privacy))
+
+        exported = self.post_json("/api/system/export", {"output_path": str(output_path)})
+        self.assertEqual(exported["status"], "exported")
+        self.assertTrue(output_path.exists())
+        with zipfile.ZipFile(output_path) as archive:
+            names = set(archive.namelist())
+        self.assertIn("manifest.json", names)
+        self.assertIn("notes/note.md", names)
+
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            self.post_json("/api/system/wipe", {"confirm": "wrong"})
+        self.assertEqual(rejected.exception.code, 400)
+
+        wiped = self.post_json("/api/system/wipe", {"confirm": "DELETE-SPEEDWAGON-DATA"})
+        self.assertEqual(wiped["status"], "wiped")
+        self.assertFalse(note_path.exists())
+        self.assertTrue(self.settings.notes_dir.exists())
+
+    def test_api_500_is_generic_and_logs_detail(self) -> None:
+        secret = self.api_token
+        with patch(
+            "speedwagon_ai.app.settings_payload",
+            side_effect=RuntimeError(f"secret backend detail Authorization: Bearer {secret} https://zoom.us/j/123?pwd=topsecret"),
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.get_json("/api/settings")
+
+        self.assertEqual(raised.exception.code, 500)
+        body = raised.exception.read().decode("utf-8")
+        self.assertIn("Internal SpeedwagonAI error", body)
+        self.assertNotIn("secret backend detail", body)
+
+        logs = self.get_json("/api/system/logs")
+        self.assertIn("secret backend detail", logs["log_tail"])
+        self.assertNotIn(secret, logs["log_tail"])
+        self.assertNotIn("pwd=topsecret", logs["log_tail"])
+        self.assertIn("[REDACTED]", logs["log_tail"])
 
     def test_capture_status_and_diagnostics_api(self) -> None:
         status = self.get_json("/api/capture/status")
@@ -281,7 +390,29 @@ class AppApiTests(unittest.TestCase):
 
         self.assertEqual(stopped["transcript"], "please handle my life")
         self.assertFalse(stopped["assistant_response"]["supported"])
-        self.assertIn("Unsupported command", stopped["assistant_response"]["summary"])
+        self.assertIn("could not safely", stopped["assistant_response"]["summary"].lower())
+
+    def test_assistant_voice_transcribe_does_not_run_command(self) -> None:
+        class FakeProcess:
+            pid = 99994
+
+            def poll(self) -> None:
+                return None
+
+        def fake_transcribe(settings: Settings, audio_path: Path, output_base: Path) -> Path:
+            transcript_path = settings.transcripts_dir / "assistant-voice-dictation.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text("discuss launch notes", encoding="utf-8")
+            return transcript_path
+
+        with patch("speedwagon_ai.capture.subprocess.Popen", return_value=FakeProcess()), patch("speedwagon_ai.capture.os.kill"):
+            started = self.post_json("/api/assistant/voice/start", {})
+            Path(started["session"]["audio_path"]).write_bytes(b"0" * 5000)
+            with patch("speedwagon_ai.capture.transcribe_audio", side_effect=fake_transcribe):
+                stopped = self.post_json("/api/assistant/voice/transcribe", {})
+
+        self.assertEqual(stopped["transcript"], "discuss launch notes")
+        self.assertNotIn("assistant_response", stopped)
 
     def test_voice_task_stop_extracts_due_date_from_transcript(self) -> None:
         class FakeProcess:
@@ -384,6 +515,191 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(confirmed["suggestion"]["status"], "accepted")
         self.assertTrue(confirmed["action_result"]["tasks"])
 
+    def test_context_detail_api_returns_review_objects_without_paths(self) -> None:
+        meeting = self.repo.create_meeting("DairyMGT review")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Reviewed DairyMGT rollout.",
+                key_topics=["DairyMGT"],
+                entities=["Megan"],
+                decisions=["Ship the staged rollout"],
+                raw={"summary": "Reviewed DairyMGT rollout."},
+            ),
+        )
+        task = self.post_json("/api/tasks", {"text": "Email Megan about DairyMGT rollout", "project": "DairyMGT"})["task"]
+        context = next(item for item in self.repo.find_contexts("DairyMGT") if item["name"] == "DairyMGT")
+        suggestion = self.repo.create_suggestion(
+            title="Draft follow-up for DairyMGT",
+            reason="Megan needs the rollout update.",
+            proposed_action="draft_email_from_context",
+            payload={"context_id": context["id"], "task_id": task["id"]},
+            context_id=context["id"],
+            task_ids=[task["id"]],
+            meeting_ids=[meeting.id],
+        )
+        self.repo.create_followup_draft(
+            suggestion_id=suggestion["id"],
+            task_id=task["id"],
+            context_id=context["id"],
+            meeting_id=meeting.id,
+            recipient="megan@example.com",
+            subject="DairyMGT rollout",
+            body="Hi Megan",
+        )
+
+        detail = self.get_json(f"/api/contexts/{context['id']}/detail")
+
+        self.assertEqual(detail["context"]["name"], "DairyMGT")
+        self.assertTrue(any(item["id"] == task["id"] for item in detail["tasks"]))
+        self.assertTrue(any(item["id"] == meeting.id for item in detail["meetings"]))
+        self.assertTrue(any(item["text"] == "Ship the staged rollout" for item in detail["decisions"]))
+        self.assertTrue(any(item["id"] == suggestion["id"] for item in detail["suggestions"]))
+        self.assertTrue(detail["followup_drafts"])
+        self.assertNotIn("transcript_path", json.dumps(detail["meetings"]))
+        self.assertNotIn("note_path", json.dumps(detail["meetings"]))
+        self.assertNotIn(self.api_token, json.dumps(detail))
+
+        updated = self.post_json(
+            f"/api/contexts/{context['id']}/profile",
+            {
+                "email": "megan@example.com",
+                "phone": "+1 555 0100",
+                "role": "Pilot lead",
+                "company": "DairyMGT",
+                "notes": "Prefers short launch updates.",
+            },
+        )
+        self.assertEqual(updated["context"]["profile_email"], "megan@example.com")
+        self.assertEqual(updated["context"]["profile_phone"], "+1 555 0100")
+        self.assertEqual(updated["context"]["profile_role"], "Pilot lead")
+        self.assertEqual(updated["context"]["profile_company"], "DairyMGT")
+        self.assertEqual(updated["context"]["profile_notes"], "Prefers short launch updates.")
+
+        created = self.post_json("/api/contexts", {"name": "John", "kind": "person", "email": "john@example.com"})
+        self.assertEqual(created["context"]["name"], "John")
+        self.assertEqual(created["context"]["kind"], "person")
+        self.assertEqual(created["context"]["profile_email"], "john@example.com")
+
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.get_json("/api/contexts/not-a-number/detail")
+        self.assertEqual(invalid.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as missing:
+            self.get_json("/api/contexts/999999/detail")
+        self.assertEqual(missing.exception.code, 404)
+
+    def test_confirm_followup_suggestion_creates_editable_local_draft(self) -> None:
+        blocker = self.post_json("/api/tasks", {"text": "Finish launch checklist", "project": "Launch"})
+        email = self.post_json("/api/tasks", {"text": "Email Megan about Launch updates", "project": "Launch"})
+        self.post_json(f"/api/tasks/{blocker['task']['id']}/complete", {})
+        suggestion = next(
+            item
+            for item in self.get_json("/api/suggestions")["suggestions"]
+            if item["proposed_action"] == "draft_email_from_context" and email["task"]["id"] in item["task_ids"]
+        )
+
+        confirmed = self.post_json(f"/api/suggestions/{suggestion['id']}/confirm", {})
+        draft = confirmed["action_result"]["followup_draft"]
+        self.assertEqual(confirmed["suggestion"]["status"], "accepted")
+        self.assertEqual(draft["suggestion_id"], suggestion["id"])
+        self.assertEqual(draft["status"], "local")
+        self.assertTrue(confirmed["action_result"]["created"])
+        self.assertFalse(confirmed["action_result"]["reused"])
+        self.assertIn("draft", confirmed["action_result"]["next_step"].lower())
+
+        repeated = self.post_json(f"/api/suggestions/{suggestion['id']}/confirm", {})
+        self.assertEqual(repeated["action_result"]["followup_draft"]["id"], draft["id"])
+        self.assertFalse(repeated["action_result"]["created"])
+        self.assertTrue(repeated["action_result"]["reused"])
+
+        all_suggestions = self.get_json("/api/suggestions?status=&limit=100")["suggestions"]
+        self.assertTrue(any(item["id"] == suggestion["id"] and item["status"] == "accepted" for item in all_suggestions))
+
+        cleared = self.post_json("/api/suggestions/reviewed/clear", {})
+        self.assertGreaterEqual(cleared["cleared"], 1)
+        self.assertEqual(self.repo.get_suggestion(suggestion["id"])["status"], "archived")
+
+        detail = self.get_json(f"/api/suggestions/{suggestion['id']}")
+        self.assertEqual(detail["suggestion"]["id"], suggestion["id"])
+        self.assertEqual(detail["followup_draft"]["id"], draft["id"])
+        self.assertEqual(detail["review_status"], "archived")
+        self.assertIsInstance(detail["related_tasks"], list)
+
+        listed = self.get_json("/api/email/drafts")
+        self.assertTrue(any(item["id"] == draft["id"] for item in listed["drafts"]))
+
+        updated = self.post_json(
+            f"/api/email/drafts/{draft['id']}/update",
+            {"to": "megan@example.com", "subject": "Launch update", "body": "Edited launch update.\n\n[Your Name]"},
+        )["draft"]
+        self.assertEqual(updated["recipient"], "megan@example.com")
+        self.assertEqual(updated["body"], "Edited launch update.\n\nAnish Gogineni")
+
+        with patch("speedwagon_ai.app.create_gmail_draft_from_content", return_value="gmail-draft-1") as create_draft:
+            gmail = self.post_json(f"/api/email/drafts/{draft['id']}/gmail-draft", {})
+
+        self.assertEqual(gmail["draft_id"], "gmail-draft-1")
+        self.assertEqual(gmail["draft"]["status"], "gmail_draft")
+        self.assertEqual(gmail["draft"]["provider_draft_id"], "gmail-draft-1")
+        self.assertEqual(create_draft.call_args.kwargs["to"], "megan@example.com")
+        self.assertEqual(create_draft.call_args.args[1].body, "Edited launch update.\n\nAnish Gogineni")
+
+        with patch("speedwagon_ai.app.create_gmail_draft_from_content") as create_again:
+            repeated_gmail = self.post_json(f"/api/email/drafts/{draft['id']}/gmail-draft", {})
+        self.assertTrue(repeated_gmail["reused"])
+        self.assertEqual(repeated_gmail["draft_id"], "gmail-draft-1")
+        create_again.assert_not_called()
+
+    def test_confirm_add_task_suggestion_is_idempotent_and_failure_keeps_open(self) -> None:
+        suggestion = self.repo.create_suggestion(
+            title="Add inferred follow-up",
+            reason="Meeting implied this work.",
+            proposed_action="add_task",
+            payload={
+                "text": "Send inferred recap",
+                "due_date": "2026-06-07",
+                "source": "implicit_followup",
+                "source_meeting_id": 1,
+            },
+            meeting_ids=[1],
+        )
+
+        confirmed = self.post_json(f"/api/suggestions/{suggestion['id']}/confirm", {})
+        task = confirmed["action_result"]["task"]
+        self.assertEqual(confirmed["suggestion"]["status"], "accepted")
+        self.assertTrue(confirmed["action_result"]["created"])
+
+        repeated = self.post_json(f"/api/suggestions/{suggestion['id']}/confirm", {})
+        self.assertEqual(repeated["action_result"]["task"]["id"], task["id"])
+        self.assertFalse(repeated["action_result"]["created"])
+        self.assertTrue(repeated["action_result"]["reused"])
+
+        broken = self.repo.create_suggestion(
+            title="Broken task",
+            reason="Missing text.",
+            proposed_action="add_task",
+            payload={"text": ""},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            self.post_json(f"/api/suggestions/{broken['id']}/confirm", {})
+        self.assertEqual(rejected.exception.code, 400)
+        self.assertEqual(self.repo.get_suggestion(broken["id"])["status"], "open")
+
+    def test_clear_done_tasks_archives_completed_tasks(self) -> None:
+        done = self.post_json("/api/tasks", {"text": "Finished task"})["task"]
+        open_task = self.post_json("/api/tasks", {"text": "Still open"})["task"]
+        self.post_json(f"/api/tasks/{done['id']}/complete", {})
+
+        cleared = self.post_json("/api/tasks/done/clear", {})
+        self.assertEqual(cleared["cleared"], 1)
+
+        tasks = self.get_json("/api/tasks?status=&include_done=true")["tasks"]
+        archived = next(item for item in tasks if item["id"] == done["id"])
+        still_open = next(item for item in tasks if item["id"] == open_task["id"])
+        self.assertEqual(archived["status"], "archived")
+        self.assertEqual(still_open["status"], "open")
+
     def test_notification_apis(self) -> None:
         task = self.post_json("/api/tasks", {"text": "Send notification follow-up", "due_date": "2026-06-01"})["task"]
 
@@ -432,6 +748,23 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(confirmed["action"], "add_task")
         self.assertEqual(confirmed["result"]["task"]["text"], "Confirm API task")
         self.assertEqual(confirmed["result"]["pending_action"]["status"], "confirmed")
+
+        task = self.repo.create_task("Plural payload task")
+        complete_me = self.repo.create_pending_action(
+            command="complete #22",
+            action="complete_task",
+            category="tasks",
+            payload={"task_ids": [task["id"]]},
+            confidence=1.0,
+            source="screenshot",
+            explanation="User requested to complete a task.",
+            safety_notes=["Requires confirmation."],
+        )
+        completed = self.post_json(f"/api/assistant/actions/{complete_me['id']}/confirm", {})
+        self.assertEqual(completed["action"], "complete_task")
+        self.assertEqual(completed["result"]["task"]["id"], task["id"])
+        self.assertEqual(completed["result"]["task"]["status"], "done")
+        self.assertEqual(completed["result"]["pending_action"]["status"], "confirmed")
 
         cancel_me = self.repo.create_pending_action(
             command="cancel me",
@@ -556,13 +889,39 @@ class AppApiTests(unittest.TestCase):
         bot = self.get_json("/api/capture/bot/status")
         self.assertFalse(bot["enabled"])
 
+    def test_daily_intelligence_refresh_is_cached_and_updates_suggestion_narratives(self) -> None:
+        task = self.post_json("/api/tasks", {"text": "Send intelligence recap", "due_date": "2020-01-01"})["task"]
+        suggestion = next(
+            item
+            for item in self.get_json("/api/notifications/candidates")["candidates"]
+            if task["id"] in item["task_ids"]
+        )
+
+        status = self.get_json("/api/intelligence/daily")
+        self.assertIsNone(status["cached"])
+
+        refreshed = self.post_json("/api/intelligence/daily/refresh", {"date": "2026-06-04", "top_suggestion_limit": 8})
+
+        self.assertEqual(refreshed["status"], "refreshed")
+        self.assertEqual(refreshed["synthesis"]["date"], "2026-06-04")
+        self.assertEqual(refreshed["synthesis"]["provider"], "fallback")
+        self.assertTrue(refreshed["input_fingerprint"])
+        self.assertTrue(any(item["id"] == suggestion["id"] for item in refreshed["updated_suggestions"]))
+
+        cached = self.get_json("/api/intelligence/daily?date=2026-06-04")
+        self.assertEqual(cached["cached"]["date"], "2026-06-04")
+        self.assertTrue(cached["manual_refresh_required"])
+
+        brief = self.get_json("/api/daily-brief")
+        self.assertIn("synthesis", brief)
+
     def test_bot_capture_api_join_sync_and_process_with_fake_provider(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as failure:
             self.post_json(
                 "/api/capture/bot/join",
                 {"meeting_url": "https://meet.google.com/abc-defg-hij", "title": "No Consent"},
             )
-        self.assertEqual(failure.exception.code, 500)
+        self.assertEqual(failure.exception.code, 400)
 
         with patch("speedwagon_ai.meeting_bot.provider_from_settings", return_value=FakeMeetingBotProvider(self.settings)):
             joined = self.post_json(
@@ -593,6 +952,10 @@ class AppApiTests(unittest.TestCase):
         self.assertEqual(session["meeting_url_display"], "https://meet.google.com/abc-defg-hij")
         self.assertTrue(Path(synced["transcript_path"]).exists())
         self.assertEqual(processed["meeting"]["id"], session["meeting_id"])
+        cleared = self.post_json("/api/capture/bot/sessions/clear", {})
+        self.assertEqual(cleared["cleared_count"], 1)
+        self.assertEqual(cleared["sessions"], [])
+        self.assertEqual(self.repo.get_meeting(session["meeting_id"]).id, session["meeting_id"])
 
     def test_calendar_sync_api_uses_service(self) -> None:
         with patch(
@@ -612,15 +975,85 @@ class AppApiTests(unittest.TestCase):
         sync.assert_called_once()
         self.assertEqual(result["synced_count"], 1)
 
+    def test_calendar_create_api_validates_and_uses_service(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.post_json(
+                "/api/calendar/events",
+                {
+                    "title": "Bad event",
+                    "start_at": "2026-06-08T10:00:00-07:00",
+                    "end_at": "2026-06-08T09:00:00-07:00",
+                },
+            )
+        self.assertEqual(invalid.exception.code, 400)
+
+        with patch(
+            "speedwagon_ai.app.GoogleCalendarService.create_event",
+            return_value={
+                "status": "created",
+                "provider": "google",
+                "calendar_id": "primary",
+                "event": {
+                    "id": 12,
+                    "provider": "google",
+                    "provider_event_id": "created-1",
+                    "calendar_id": "primary",
+                    "title": "Pilot planning",
+                    "description_snippet": "Discuss launch",
+                    "start_at": "2026-06-08T10:00:00-07:00",
+                    "end_at": "2026-06-08T10:30:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                    "location": None,
+                    "meeting_url": None,
+                    "attendees": [{"email": "alex@example.com"}],
+                    "status": "confirmed",
+                    "html_link": "https://calendar.google.com/event?eid=created-1",
+                    "raw_json_path": None,
+                    "last_synced_at": "2026-06-05T00:00:00Z",
+                },
+                "html_link": "https://calendar.google.com/event?eid=created-1",
+                "send_updates": "none",
+            },
+        ) as create_event:
+            result = self.post_json(
+                "/api/calendar/events",
+                {
+                    "title": "Pilot planning",
+                    "start_at": "2026-06-08T10:00:00-07:00",
+                    "end_at": "2026-06-08T10:30:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                    "attendees": ["alex@example.com"],
+                    "send_updates": "none",
+                },
+            )
+
+        create_event.assert_called_once()
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(result["event"]["title"], "Pilot planning")
+
     def get_json(self, path: str) -> dict:
-        with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5) as response:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            headers={"Authorization": f"Bearer {self.api_token}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def post_json(self, path: str, payload: dict) -> dict:
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_token}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def post_raw(self, path: str, data: bytes, content_type: str) -> dict:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers={"Content-Type": content_type, "Authorization": f"Bearer {self.api_token}"},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=5) as response:

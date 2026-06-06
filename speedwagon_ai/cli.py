@@ -15,10 +15,12 @@ from speedwagon_ai.context import render_context
 from speedwagon_ai.extraction import Extractor
 from speedwagon_ai.integrations.calendar import GoogleCalendarService
 from speedwagon_ai.integrations.gmail import create_gmail_draft, preview_followup_email
+from speedwagon_ai.intelligence import intelligence_status, refresh_daily_intelligence
 from speedwagon_ai.meeting_bot import MeetingBotService
 from speedwagon_ai.output import MarkdownWriter
 from speedwagon_ai.processing import process_meeting
 from speedwagon_ai.storage import Repository
+from speedwagon_ai.system_tools import export_data, wipe_data
 from speedwagon_ai.transcription import Transcriber
 from speedwagon_ai.voice_tasks import VoiceTaskRecorder
 
@@ -46,6 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     app_parser.add_argument("--host")
     app_parser.add_argument("--port", type=int)
     app_parser.set_defaults(func=cmd_app)
+
+    export_parser = subparsers.add_parser("export", help="Export local SpeedwagonAI data to a zip file.")
+    export_parser.add_argument("--output", type=Path)
+    export_parser.set_defaults(func=cmd_export)
+
+    wipe_parser = subparsers.add_parser("wipe", help="Delete local SpeedwagonAI data after exact confirmation.")
+    wipe_parser.add_argument("--confirm", required=True)
+    wipe_parser.set_defaults(func=cmd_wipe)
 
     ask_parser = subparsers.add_parser("ask", help="Run a one-line SpeedwagonAI assistant command.")
     ask_parser.add_argument("command")
@@ -96,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     bot_process.add_argument("session_id", type=int)
     bot_process.set_defaults(func=cmd_bot_process)
 
-    calendar_parser = subparsers.add_parser("calendar", help="Google Calendar read-only integration.")
+    calendar_parser = subparsers.add_parser("calendar", help="Google Calendar integration.")
     calendar_sub = calendar_parser.add_subparsers(dest="calendar_command", required=True)
     calendar_status = calendar_sub.add_parser("status", help="Show Google Calendar sync status.")
     calendar_status.set_defaults(func=cmd_calendar_status)
@@ -105,6 +115,18 @@ def build_parser() -> argparse.ArgumentParser:
     calendar_upcoming = calendar_sub.add_parser("upcoming", help="List upcoming synced Calendar events.")
     calendar_upcoming.add_argument("--limit", type=int, default=10)
     calendar_upcoming.set_defaults(func=cmd_calendar_upcoming)
+    calendar_create = calendar_sub.add_parser("create", help="Create a Google Calendar event after explicit confirmation.")
+    calendar_create.add_argument("--title", required=True)
+    calendar_create.add_argument("--start", required=True, help="ISO datetime, for example 2026-06-08T10:00:00-07:00")
+    calendar_create.add_argument("--end", required=True, help="ISO datetime, for example 2026-06-08T10:30:00-07:00")
+    calendar_create.add_argument("--calendar-id", default="primary")
+    calendar_create.add_argument("--timezone")
+    calendar_create.add_argument("--description")
+    calendar_create.add_argument("--location")
+    calendar_create.add_argument("--attendee", action="append", default=[], help="Attendee email. Repeat for multiple attendees.")
+    calendar_create.add_argument("--send-updates", choices=["all", "externalOnly", "none"], default="none")
+    calendar_create.add_argument("--confirm-write", action="store_true", help="Required. Confirms SpeedwagonAI should write to Google Calendar.")
+    calendar_create.set_defaults(func=cmd_calendar_create)
 
     notifications_parser = subparsers.add_parser("notifications", help="Native notification candidate tools.")
     notifications_sub = notifications_parser.add_subparsers(dest="notifications_command", required=True)
@@ -120,6 +142,16 @@ def build_parser() -> argparse.ArgumentParser:
     notifications_dismiss = notifications_sub.add_parser("dismiss", help="Dismiss a notification candidate.")
     notifications_dismiss.add_argument("suggestion_id", type=int)
     notifications_dismiss.set_defaults(func=cmd_notifications_dismiss)
+
+    intelligence_parser = subparsers.add_parser("intelligence", help="Cached daily intelligence tools.")
+    intelligence_sub = intelligence_parser.add_subparsers(dest="intelligence_command", required=True)
+    intelligence_status_parser = intelligence_sub.add_parser("status", help="Show cached daily intelligence status.")
+    intelligence_status_parser.add_argument("--date")
+    intelligence_status_parser.set_defaults(func=cmd_intelligence_status)
+    intelligence_refresh = intelligence_sub.add_parser("refresh", help="Refresh daily synthesis and top suggestion narratives.")
+    intelligence_refresh.add_argument("--date")
+    intelligence_refresh.add_argument("--top-suggestions", type=int, default=8)
+    intelligence_refresh.set_defaults(func=cmd_intelligence_refresh)
 
     transcribe_parser = subparsers.add_parser("transcribe", help="Transcribe a meeting with whisper.cpp.")
     transcribe_parser.add_argument("meeting_id", type=int)
@@ -234,6 +266,22 @@ def cmd_init(args: argparse.Namespace, settings: Settings, repo: Repository) -> 
 def cmd_app(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
     repo.init()
     run_app(settings, repo, host=args.host or settings.app_host, port=args.port or settings.app_port)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = export_data(settings, repo, args.output)
+    print(f"Exported SpeedwagonAI data: {result['path']}")
+    print(f"Files: {result['file_count']}")
+    return 0
+
+
+def cmd_wipe(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    result = wipe_data(settings, repo, args.confirm)
+    print("Wiped SpeedwagonAI local data.")
+    for path in result["removed"]:
+        print(f"- {path}")
     return 0
 
 
@@ -409,6 +457,8 @@ def cmd_calendar_sync(args: argparse.Namespace, settings: Settings, repo: Reposi
     repo.init()
     result = GoogleCalendarService(settings, repo).sync()
     print(f"Synced {result['synced_count']} calendar events.")
+    if result.get("removed_count"):
+        print(f"Removed {result['removed_count']} locally cached event(s) no longer present in Google Calendar.")
     print(f"Window: {result['time_min']} to {result['time_max']}")
     return 0
 
@@ -417,6 +467,30 @@ def cmd_calendar_upcoming(args: argparse.Namespace, settings: Settings, repo: Re
     repo.init()
     events = GoogleCalendarService(settings, repo).upcoming(limit=args.limit)["events"]
     print_calendar_events(events)
+    return 0
+
+
+def cmd_calendar_create(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    if not args.confirm_write:
+        print("Refusing to write Google Calendar without --confirm-write.")
+        return 2
+    result = GoogleCalendarService(settings, repo).create_event(
+        title=args.title,
+        start_at=args.start,
+        end_at=args.end,
+        calendar_id=args.calendar_id,
+        timezone_name=args.timezone,
+        description=args.description,
+        location=args.location,
+        attendees=args.attendee,
+        send_updates=args.send_updates,
+    )
+    event = result["event"]
+    print(f"Created Google Calendar event #{event['id']}: {event['title']}")
+    print(f"When: {event['start_at']} to {event['end_at']}")
+    if event.get("html_link"):
+        print(f"Link: {event['html_link']}")
     return 0
 
 
@@ -493,6 +567,29 @@ def cmd_commitments(args: argparse.Namespace, settings: Settings, repo: Reposito
 def cmd_brief(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
     repo.init()
     print_daily_brief(repo.daily_brief())
+    return 0
+
+
+def cmd_intelligence_status(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    status = intelligence_status(repo, args.date)
+    print(f"Daily intelligence for {status['date']}")
+    if status.get("cached"):
+        print_synthesis(status["cached"])
+    else:
+        print("No cached synthesis.")
+    if status.get("latest") and not status.get("cached"):
+        print("\nLatest cached synthesis:")
+        print_synthesis(status["latest"])
+    return 0
+
+
+def cmd_intelligence_refresh(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    repo.init()
+    result = refresh_daily_intelligence(settings, repo, args.date, top_suggestion_limit=args.top_suggestions)
+    print(f"Refreshed daily intelligence for {result['date']}")
+    print_synthesis(result["synthesis"])
+    print(f"Updated {len(result.get('updated_suggestions') or [])} suggestion narrative(s).")
     return 0
 
 
@@ -618,6 +715,8 @@ def print_tasks(tasks: list[dict]) -> None:
 
 def print_daily_brief(brief: dict) -> None:
     print(f"Daily brief for {brief['date']}")
+    if brief.get("synthesis"):
+        print_synthesis(brief["synthesis"])
     for key, label in [
         ("overdue", "Overdue"),
         ("today", "Due today"),
@@ -628,6 +727,22 @@ def print_daily_brief(brief: dict) -> None:
     ]:
         print(f"\n{label}")
         print_tasks(brief.get(key, []))
+
+
+def print_synthesis(synthesis: dict) -> None:
+    print(f"\nSynthesis ({synthesis.get('provider') or 'unknown'} · {synthesis.get('generated_at') or 'not generated'})")
+    print(synthesis.get("summary") or "No summary.")
+    for key, label in [
+        ("risks", "Risks"),
+        ("dropped_threads", "Dropped threads"),
+        ("followups", "Follow-ups"),
+        ("recent_changes", "Recent changes"),
+    ]:
+        values = synthesis.get(key) or []
+        if values:
+            print(f"{label}:")
+            for value in values[:6]:
+                print(f"- {value}")
 
 
 def print_capabilities(capabilities: list[dict]) -> None:

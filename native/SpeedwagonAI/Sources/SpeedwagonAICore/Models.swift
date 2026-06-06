@@ -22,6 +22,14 @@ public struct TaskEnvelope: Codable, Equatable {
     public let task: TaskItem
 }
 
+public struct ClearDoneTasksResponse: Codable, Equatable {
+    public let cleared: Int
+}
+
+public struct ClearSuggestionsResponse: Codable, Equatable {
+    public let cleared: Int
+}
+
 public struct CommitmentListResponse: Codable, Equatable {
     public let items: [TaskItem]
     public let commitments: [TaskItem]?
@@ -57,6 +65,11 @@ public struct ContextItem: Codable, Identifiable, Equatable {
     public let kind: String
     public let confidence: Double?
     public let reason: String?
+    public let profileEmail: String?
+    public let profilePhone: String?
+    public let profileRole: String?
+    public let profileCompany: String?
+    public let profileNotes: String?
     public let createdAt: String?
     public let updatedAt: String?
 
@@ -67,6 +80,11 @@ public struct ContextItem: Codable, Identifiable, Equatable {
         kind: String,
         confidence: Double? = nil,
         reason: String? = nil,
+        profileEmail: String? = nil,
+        profilePhone: String? = nil,
+        profileRole: String? = nil,
+        profileCompany: String? = nil,
+        profileNotes: String? = nil,
         createdAt: String? = nil,
         updatedAt: String? = nil
     ) {
@@ -76,8 +94,63 @@ public struct ContextItem: Codable, Identifiable, Equatable {
         self.kind = kind
         self.confidence = confidence
         self.reason = reason
+        self.profileEmail = profileEmail
+        self.profilePhone = profilePhone
+        self.profileRole = profileRole
+        self.profileCompany = profileCompany
+        self.profileNotes = profileNotes
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+}
+
+public struct ContextProfileUpdateRequest: Codable, Equatable {
+    public let email: String?
+    public let phone: String?
+    public let role: String?
+    public let company: String?
+    public let notes: String?
+
+    public init(
+        email: String? = nil,
+        phone: String? = nil,
+        role: String? = nil,
+        company: String? = nil,
+        notes: String? = nil
+    ) {
+        self.email = email
+        self.phone = phone
+        self.role = role
+        self.company = company
+        self.notes = notes
+    }
+}
+
+public struct ContextCreateRequest: Codable, Equatable {
+    public let name: String
+    public let kind: String?
+    public let email: String?
+    public let phone: String?
+    public let role: String?
+    public let company: String?
+    public let notes: String?
+
+    public init(
+        name: String,
+        kind: String? = "person",
+        email: String? = nil,
+        phone: String? = nil,
+        role: String? = nil,
+        company: String? = nil,
+        notes: String? = nil
+    ) {
+        self.name = name
+        self.kind = kind
+        self.email = email
+        self.phone = phone
+        self.role = role
+        self.company = company
+        self.notes = notes
     }
 }
 
@@ -192,6 +265,7 @@ public struct AssistantCommandResponse: Codable, Equatable {
     public let summary: String
     public let command: String?
     public let result: AssistantResult?
+    public let suggestedCommands: [String]?
 
     public init(
         supported: Bool,
@@ -206,7 +280,8 @@ public struct AssistantCommandResponse: Codable, Equatable {
         source: String? = nil,
         summary: String,
         command: String? = nil,
-        result: AssistantResult? = nil
+        result: AssistantResult? = nil,
+        suggestedCommands: [String]? = nil
     ) {
         self.supported = supported
         self.action = action
@@ -221,10 +296,15 @@ public struct AssistantCommandResponse: Codable, Equatable {
         self.summary = summary
         self.command = command
         self.result = result
+        self.suggestedCommands = suggestedCommands
     }
 }
 
 public struct AssistantResult: Codable, Equatable {
+    public let assistantMessage: String?
+    public let evidence: [AssistantEvidenceItem]?
+    public let draftPreview: EmailDraftPreview?
+    public let clarificationRequired: Bool?
     public let tasks: [TaskItem]?
     public let task: TaskItem?
     public let capabilities: [AssistantCapability]?
@@ -254,16 +334,48 @@ public struct AssistantResult: Codable, Equatable {
     public let pendingActions: [PendingAssistantAction]?
     public let contexts: [ContextItem]?
     public let context: ContextItem?
+    public let relationships: [ContextRelationshipItem]?
+    public let decisions: [MeetingTextItem]?
+    public let suggestedCommands: [String]?
     public let suggestions: [SuggestionItem]?
     public let suggestion: SuggestionItem?
+    public let followupDraft: FollowupDraft?
+    public let drafts: [FollowupDraft]?
+    public let created: Bool?
+    public let reused: Bool?
+    public let nextStep: String?
     public let query: String?
     public let enabled: Bool?
     public let results: [JSONValue]?
     public let sessions: [BotSession]?
     public let session: BotSession?
+    public let event: CalendarEvent?
+    public let events: [CalendarEvent]?
 
     public var hasTaskMutation: Bool {
         task != nil
+    }
+}
+
+public struct AssistantEvidenceItem: Codable, Equatable {
+    public let kind: String
+    public let id: Int?
+    public let title: String
+    public let subtitle: String?
+
+    public var idValue: String {
+        "\(kind):\(id.map(String.init) ?? title)"
+    }
+
+    public var displayLine: String {
+        var prefix = kind.replacingOccurrences(of: "_", with: " ")
+        if let id {
+            prefix += " #\(id)"
+        }
+        if let subtitle, !subtitle.isEmpty {
+            return "\(prefix): \(title) · \(subtitle)"
+        }
+        return "\(prefix): \(title)"
     }
 }
 
@@ -350,6 +462,10 @@ public struct NotificationAuditItem: Codable, Equatable, Identifiable {
 
 public struct SuggestionEnvelope: Codable, Equatable {
     public let suggestion: SuggestionItem
+    public let actionResult: AssistantResult?
+    public let relatedTasks: [TaskItem]?
+    public let followupDraft: FollowupDraft?
+    public let reviewStatus: String?
 }
 
 public struct ContextGraphResponse: Codable, Equatable {
@@ -357,7 +473,37 @@ public struct ContextGraphResponse: Codable, Equatable {
     public let contexts: [ContextItem]
     public let tasks: [TaskItem]
     public let meetings: [MeetingItem]
+    public let relationships: [ContextRelationshipItem]?
     public let suggestions: [SuggestionItem]
+}
+
+public struct ContextDetailResponse: Codable, Equatable {
+    public let context: ContextItem
+    public let relatedContexts: [ContextItem]
+    public let relationships: [ContextRelationshipItem]
+    public let tasks: [TaskItem]
+    public let meetings: [MeetingItem]
+    public let decisions: [MeetingTextItem]
+    public let suggestions: [SuggestionItem]
+    public let followupDrafts: [FollowupDraft]
+}
+
+public struct ContextRelationshipItem: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let sourceContext: ContextItem
+    public let targetContext: ContextItem
+    public let relationshipType: String
+    public let evidence: String?
+    public let confidence: Double?
+    public let sourceMeetingId: Int?
+    public let sourceMeetingTitle: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+
+    public var displayLine: String {
+        let relation = relationshipType.replacingOccurrences(of: "_", with: " ")
+        return "\(sourceContext.name) \(relation) \(targetContext.name)"
+    }
 }
 
 public struct SuggestionItem: Codable, Identifiable, Equatable {
@@ -452,8 +598,50 @@ public struct EmailDraftPreview: Codable, Equatable {
     public let to: String?
 }
 
+public struct FollowupDraftListResponse: Codable, Equatable {
+    public let drafts: [FollowupDraft]
+}
+
+public struct FollowupDraftEnvelope: Codable, Equatable {
+    public let draft: FollowupDraft
+    public let draftId: String?
+}
+
+public struct FollowupDraft: Codable, Identifiable, Equatable {
+    public let id: Int
+    public let suggestionId: Int?
+    public let taskId: Int?
+    public let contextId: Int?
+    public let meetingId: Int?
+    public let provider: String?
+    public let providerDraftId: String?
+    public let recipient: String?
+    public let subject: String
+    public let body: String
+    public let status: String
+    public let source: String?
+    public let contextName: String?
+    public let taskText: String?
+    public let meetingTitle: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+}
+
+public struct FollowupDraftUpdateRequest: Codable, Equatable {
+    public let to: String?
+    public let subject: String?
+    public let body: String?
+
+    public init(to: String? = nil, subject: String? = nil, body: String? = nil) {
+        self.to = to
+        self.subject = subject
+        self.body = body
+    }
+}
+
 public struct DailyBriefResponse: Codable, Equatable {
     public let date: String
+    public let synthesis: DailySynthesis?
     public let overdue: [TaskItem]
     public let today: [TaskItem]
     public let upcoming: [TaskItem]
@@ -470,6 +658,62 @@ public struct DailyBriefResponse: Codable, Equatable {
     public let counts: [String: Int]
 }
 
+public struct DailySynthesis: Codable, Equatable {
+    public let id: Int?
+    public let date: String
+    public let summary: String
+    public let risks: [String]
+    public let droppedThreads: [String]
+    public let followups: [String]
+    public let recentChanges: [String]
+    public let provider: String?
+    public let model: String?
+    public let generatedAt: String?
+    public let inputFingerprint: String?
+    public let createdAt: String?
+    public let updatedAt: String?
+}
+
+public struct IntelligenceStatusResponse: Codable, Equatable {
+    public let date: String
+    public let cached: DailySynthesis?
+    public let latest: DailySynthesis?
+    public let manualRefreshRequired: Bool?
+    public let note: String?
+
+    public init(
+        date: String,
+        cached: DailySynthesis? = nil,
+        latest: DailySynthesis? = nil,
+        manualRefreshRequired: Bool? = nil,
+        note: String? = nil
+    ) {
+        self.date = date
+        self.cached = cached
+        self.latest = latest
+        self.manualRefreshRequired = manualRefreshRequired
+        self.note = note
+    }
+}
+
+public struct IntelligenceRefreshRequest: Codable, Equatable {
+    public let date: String?
+    public let topSuggestionLimit: Int?
+
+    public init(date: String? = nil, topSuggestionLimit: Int? = nil) {
+        self.date = date
+        self.topSuggestionLimit = topSuggestionLimit
+    }
+}
+
+public struct IntelligenceRefreshResponse: Codable, Equatable {
+    public let status: String
+    public let date: String
+    public let synthesis: DailySynthesis
+    public let updatedSuggestions: [SuggestionItem]
+    public let inputFingerprint: String?
+}
+
 public struct CalendarStatusResponse: Codable, Equatable {
     public let enabled: Bool
     public let provider: String?
@@ -478,6 +722,8 @@ public struct CalendarStatusResponse: Codable, Equatable {
     public let credentialsPresent: Bool?
     public let tokenPresent: Bool?
     public let calendarScopePresent: Bool?
+    public let calendarWriteScopePresent: Bool?
+    public let writeEnabled: Bool?
     public let calendarIds: [String]?
     public let syncDaysBack: Int?
     public let syncDaysForward: Int?
@@ -494,7 +740,51 @@ public struct CalendarSyncResponse: Codable, Equatable {
     public let timeMin: String?
     public let timeMax: String?
     public let syncedCount: Int
+    public let removedCount: Int?
     public let events: [CalendarEvent]
+}
+
+public struct CalendarCreateEventRequest: Codable, Equatable {
+    public let title: String
+    public let startAt: String
+    public let endAt: String
+    public let calendarId: String?
+    public let timezone: String?
+    public let description: String?
+    public let location: String?
+    public let attendees: [String]
+    public let sendUpdates: String?
+
+    public init(
+        title: String,
+        startAt: String,
+        endAt: String,
+        calendarId: String? = nil,
+        timezone: String? = nil,
+        description: String? = nil,
+        location: String? = nil,
+        attendees: [String] = [],
+        sendUpdates: String? = "none"
+    ) {
+        self.title = title
+        self.startAt = startAt
+        self.endAt = endAt
+        self.calendarId = calendarId
+        self.timezone = timezone
+        self.description = description
+        self.location = location
+        self.attendees = attendees
+        self.sendUpdates = sendUpdates
+    }
+}
+
+public struct CalendarCreateEventResponse: Codable, Equatable {
+    public let status: String
+    public let provider: String?
+    public let calendarId: String?
+    public let event: CalendarEvent
+    public let htmlLink: String?
+    public let sendUpdates: String?
 }
 
 public struct CalendarEvent: Codable, Identifiable, Equatable {
@@ -544,6 +834,10 @@ public struct SettingsResponse: Codable, Equatable {
     public let webModel: String?
     public let modelCostLabels: [String: String]?
     public let webSearchEnabled: Bool?
+    public let apiTokenPath: String?
+    public let logDir: String?
+    public let appLogPath: String?
+    public let backendLogPath: String?
     public let gmailCredentialsPresent: Bool?
     public let gmailTokenPresent: Bool?
     public let calendarStatus: String?
@@ -564,6 +858,72 @@ public struct SettingsResponse: Codable, Equatable {
     public let botNote: String?
 }
 
+public struct SystemLogsResponse: Codable, Equatable {
+    public let logDir: String
+    public let appLogPath: String
+    public let backendLogPath: String
+    public let appLogExists: Bool
+    public let backendLogExists: Bool
+    public let logTail: String
+    public let backendLogTail: String
+}
+
+public struct PrivacyStatusResponse: Codable, Equatable {
+    public let dbPath: String
+    public let notesDir: String
+    public let audioDir: String
+    public let transcriptsDir: String
+    public let logsDir: String
+    public let exportSupported: Bool
+    public let wipeSupported: Bool
+    public let wipeConfirmation: String
+    public let existingPaths: [String]
+    public let counts: [String: Int]
+    public let pathVisibilityNote: String?
+    public let localDataDirs: [String: String]?
+    public let externalServices: [String: ExternalServiceStatus]?
+    public let dataDisclosures: [DataDisclosure]?
+}
+
+public struct ExternalServiceStatus: Codable, Equatable {
+    public let configured: Bool
+    public let purpose: String
+}
+
+public struct DataDisclosure: Codable, Equatable {
+    public let service: String
+    public let enabled: Bool
+    public let data: String
+    public let trigger: String
+}
+
+public struct SystemExportRequest: Codable, Equatable {
+    public let outputPath: String?
+
+    public init(outputPath: String? = nil) {
+        self.outputPath = outputPath
+    }
+}
+
+public struct SystemExportResponse: Codable, Equatable {
+    public let status: String
+    public let path: String
+    public let fileCount: Int
+}
+
+public struct SystemWipeRequest: Codable, Equatable {
+    public let confirm: String
+
+    public init(confirm: String) {
+        self.confirm = confirm
+    }
+}
+
+public struct SystemWipeResponse: Codable, Equatable {
+    public let status: String
+    public let removed: [String]
+}
+
 public struct BotStatusResponse: Codable, Equatable {
     public let enabled: Bool
     public let provider: String?
@@ -578,6 +938,11 @@ public struct BotStatusResponse: Codable, Equatable {
 }
 
 public struct BotSessionListResponse: Codable, Equatable {
+    public let sessions: [BotSession]
+}
+
+public struct BotSessionClearResponse: Codable, Equatable {
+    public let clearedCount: Int
     public let sessions: [BotSession]
 }
 
@@ -775,6 +1140,13 @@ public struct AssistantVoiceStopResponse: Codable, Equatable {
     public let session: CaptureSession
     public let transcript: String
     public let assistantResponse: AssistantCommandResponse
+    public let audioPath: String
+    public let transcriptPath: String
+}
+
+public struct AssistantVoiceTranscriptResponse: Codable, Equatable {
+    public let session: CaptureSession
+    public let transcript: String
     public let audioPath: String
     public let transcriptPath: String
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,9 @@ class Settings:
     google_calendar_ids: str = "primary"
     google_calendar_sync_days_back: int = 14
     google_calendar_sync_days_forward: int = 30
+    api_token: str = ""
+    api_token_path: Path = Path("data/local_api_token")
+    allow_remote_api: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -79,8 +83,32 @@ class Settings:
             google_calendar_ids=os.getenv("GOOGLE_CALENDAR_IDS", "primary"),
             google_calendar_sync_days_back=int(os.getenv("GOOGLE_CALENDAR_SYNC_DAYS_BACK", "14")),
             google_calendar_sync_days_forward=int(os.getenv("GOOGLE_CALENDAR_SYNC_DAYS_FORWARD", "30")),
+            api_token=os.getenv("SPEEDWAGON_API_TOKEN", ""),
+            api_token_path=Path(os.getenv("SPEEDWAGON_API_TOKEN_PATH", "data/local_api_token")),
+            allow_remote_api=os.getenv("SPEEDWAGON_ALLOW_REMOTE_API", "false").strip().lower()
+            in {"1", "true", "yes"},
         )
 
     def ensure_dirs(self) -> None:
-        for path in [self.db_path.parent, self.notes_dir, self.audio_dir, self.transcripts_dir, self.state_path.parent]:
+        for path in [
+            self.db_path.parent,
+            self.notes_dir,
+            self.audio_dir,
+            self.transcripts_dir,
+            self.state_path.parent,
+            self.api_token_path.parent,
+        ]:
             path.mkdir(parents=True, exist_ok=True)
+
+
+def local_api_token(settings: Settings) -> str:
+    if settings.api_token.strip():
+        return settings.api_token.strip()
+    if settings.api_token_path.exists():
+        token = settings.api_token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    settings.api_token_path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    settings.api_token_path.write_text(f"{token}\n", encoding="utf-8")
+    return token

@@ -6,12 +6,13 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from speedwagon_ai.config import Settings
 from speedwagon_ai.email_composer import fallback_compose, parse_email_content
-from speedwagon_ai.extraction import fallback_extract, parse_extraction
+from speedwagon_ai.extraction import Extractor, fallback_extract, parse_extraction
 from speedwagon_ai.integrations.gmail import preview_followup_email
-from speedwagon_ai.models import ExtractionResult, ExtractedItem, Meeting
+from speedwagon_ai.models import ExtractedFollowup, ExtractedItem, ExtractedRelationship, ExtractionResult, Meeting
 from speedwagon_ai.output import MarkdownWriter, render_commitments_markdown, render_meeting_markdown
 from speedwagon_ai.storage import Repository
 
@@ -87,11 +88,31 @@ class StorageOutputTests(unittest.TestCase):
                 suggestion_columns = {
                     row[1] for row in conn.execute("PRAGMA table_info(suggestions)").fetchall()
                 }
+                context_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(contexts)").fetchall()
+                }
                 self.assertIn("source_fingerprint", suggestion_columns)
                 self.assertIn("notification_status", suggestion_columns)
+                self.assertIn("profile_email", context_columns)
+                self.assertIn("profile_role", context_columns)
                 indexes = {row[1] for row in conn.execute("PRAGMA index_list(suggestions)").fetchall()}
                 self.assertIn("idx_suggestions_source_fingerprint", indexes)
                 conn.execute("SELECT 1 FROM suggestion_notifications LIMIT 1").fetchall()
+
+    def test_context_profile_fields_are_persistent(self) -> None:
+        context = self.repo.ensure_context("Alex", kind="person")
+        updated = self.repo.update_context_profile(
+            int(context["id"]),
+            email="alex@example.com",
+            phone="+1 555 0101",
+            role="Design lead",
+            company="Speedwagon",
+            notes="Owns onboarding wireframes.",
+        )
+
+        self.assertEqual(updated["profile_email"], "alex@example.com")
+        self.assertEqual(updated["profile_phone"], "+1 555 0101")
+        self.assertEqual(self.repo.get_context(int(context["id"]))["profile_role"], "Design lead")
 
     def test_schema_crud_and_markdown(self) -> None:
         meeting = self.repo.create_meeting("Weekly Planning", audio_path="audio/meeting-1.wav")
@@ -214,6 +235,152 @@ class StorageOutputTests(unittest.TestCase):
         self.assertEqual(followup["context"]["name"], "DairyMGT")
         self.assertIn(email["id"], followup["task_ids"])
 
+    def test_context_graph_includes_relationship_edges_and_one_hop_context(self) -> None:
+        meeting = self.repo.create_meeting("Alex DairyMGT planning")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Alex owns DairyMGT launch follow-through.",
+                key_topics=["DairyMGT"],
+                entities=["Alex"],
+                relationships=[
+                    ExtractedRelationship(
+                        source="Alex",
+                        source_kind="person",
+                        target="DairyMGT",
+                        target_kind="project",
+                        relationship_type="owns_followup",
+                        evidence="Alex owns DairyMGT launch follow-through.",
+                        confidence=0.91,
+                    )
+                ],
+                raw={"summary": "Alex owns DairyMGT launch follow-through."},
+            ),
+        )
+        task = self.repo.create_task("Ship DairyMGT launch note", project="DairyMGT")
+
+        graph = self.repo.context_graph("Alex")
+
+        self.assertTrue(any(context["name"] == "DairyMGT" for context in graph["contexts"]))
+        self.assertTrue(any(row["target_context"]["name"] == "DairyMGT" for row in graph["relationships"]))
+        self.assertTrue(any(item["id"] == task["id"] for item in graph["tasks"]))
+
+    def test_context_detail_collects_review_objects_without_paths(self) -> None:
+        meeting = self.repo.create_meeting("Alex DairyMGT planning")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Alex owns DairyMGT launch follow-through.",
+                key_topics=["DairyMGT"],
+                entities=["Alex"],
+                decisions=["Use staged rollout"],
+                relationships=[
+                    ExtractedRelationship(
+                        source="Alex",
+                        source_kind="person",
+                        target="DairyMGT",
+                        target_kind="project",
+                        relationship_type="owns_followup",
+                        evidence="Alex owns DairyMGT launch follow-through.",
+                        confidence=0.91,
+                    )
+                ],
+                raw={"summary": "Alex owns DairyMGT launch follow-through."},
+            ),
+        )
+        task = self.repo.create_task("Email Alex about DairyMGT", project="DairyMGT")
+        context = next(item for item in self.repo.find_contexts("DairyMGT") if item["name"] == "DairyMGT")
+        suggestion = self.repo.create_suggestion(
+            title="Draft follow-up for DairyMGT",
+            reason="Alex needs the launch update.",
+            proposed_action="draft_email_from_context",
+            payload={"context_id": context["id"], "task_id": task["id"]},
+            context_id=context["id"],
+            task_ids=[task["id"]],
+            meeting_ids=[meeting.id],
+        )
+        draft = self.repo.create_followup_draft(
+            suggestion_id=suggestion["id"],
+            task_id=task["id"],
+            context_id=context["id"],
+            meeting_id=meeting.id,
+            recipient="alex@example.com",
+            subject="DairyMGT follow-up",
+            body="Hi Alex",
+        )
+
+        detail = self.repo.context_detail(int(context["id"]))
+
+        self.assertEqual(detail["context"]["name"], "DairyMGT")
+        self.assertTrue(any(item["name"] == "Alex" for item in detail["related_contexts"]))
+        self.assertTrue(any(item["id"] == task["id"] for item in detail["tasks"]))
+        self.assertTrue(any(item["id"] == meeting.id for item in detail["meetings"]))
+        self.assertTrue(any(item["text"] == "Use staged rollout" for item in detail["decisions"]))
+        self.assertTrue(any(item["id"] == suggestion["id"] for item in detail["suggestions"]))
+        self.assertTrue(any(item["id"] == draft["id"] for item in detail["followup_drafts"]))
+        self.assertNotIn("transcript_path", detail["meetings"][0])
+        self.assertNotIn("note_path", detail["meetings"][0])
+
+    def test_implicit_followups_become_confirmation_suggestions(self) -> None:
+        meeting = self.repo.create_meeting("Launch follow-up")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Megan should get a launch update.",
+                implicit_followups=[
+                    ExtractedFollowup(
+                        task_text="Send Megan the launch update",
+                        implied_by="Megan should get a launch update.",
+                        owed_to="Megan",
+                        project="Launch",
+                        confidence=0.83,
+                    )
+                ],
+                raw={"summary": "Megan should get a launch update."},
+            ),
+        )
+
+        suggestion = next(item for item in self.repo.list_suggestions(status="open") if item["proposed_action"] == "add_task")
+
+        self.assertEqual(suggestion["payload"]["text"], "Send Megan the launch update")
+        self.assertEqual(suggestion["payload"]["source_meeting_id"], meeting.id)
+        self.assertEqual(suggestion["context"]["name"], "Launch")
+
+    def test_implicit_followups_dedupe_same_source_target_and_text(self) -> None:
+        meeting = self.repo.create_meeting("Launch follow-up")
+        self.repo.save_extraction(
+            meeting.id,
+            ExtractionResult(
+                summary="Megan needs one launch update.",
+                implicit_followups=[
+                    ExtractedFollowup(
+                        task_text="Send Megan the launch update",
+                        implied_by="Megan asked for a launch update.",
+                        owed_to="Megan",
+                        project="Launch",
+                        confidence=0.83,
+                    ),
+                    ExtractedFollowup(
+                        task_text="Send Megan the launch update",
+                        implied_by="The launch update is still owed to Megan.",
+                        owed_to="Megan",
+                        project="Launch",
+                        confidence=0.8,
+                    ),
+                ],
+                raw={"summary": "Megan needs one launch update."},
+            ),
+        )
+
+        suggestions = [
+            item
+            for item in self.repo.list_suggestions(status="open", limit=20)
+            if item["proposed_action"] == "add_task"
+        ]
+
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["payload"]["text"], "Send Megan the launch update")
+
     def test_followup_suggestions_are_deduped_per_email_task(self) -> None:
         meeting = self.repo.create_meeting("testMeet")
         self.repo.save_extraction(
@@ -242,6 +409,21 @@ class StorageOutputTests(unittest.TestCase):
 
         self.assertEqual(len(suggestions), 1)
         self.assertEqual(suggestions[0]["context"]["name"], "project update")
+
+    def test_snoozed_followup_source_task_does_not_create_fresh_draft_suggestion(self) -> None:
+        blocker = self.repo.create_task("Finish launch checklist", project="Launch")
+        email = self.repo.create_task("Email Megan about Launch updates", project="Launch")
+
+        self.repo.complete_task(blocker["id"])
+        self.repo.snooze_task(email["id"], "2026-06-09")
+
+        suggestions = [
+            item
+            for item in self.repo.list_suggestions(status="open", limit=20)
+            if item["proposed_action"] == "draft_email_from_context"
+        ]
+
+        self.assertEqual(suggestions, [])
 
     def test_extracted_meeting_tasks_inherit_meeting_context(self) -> None:
         meeting = self.repo.create_meeting("DairyMGT planning")
@@ -357,6 +539,7 @@ class StorageOutputTests(unittest.TestCase):
         self.assertEqual(preview["to"], "person@example.com")
         self.assertNotIn("Make it warm and focus on next steps.", preview["body"])
         self.assertIn("Send launch notes", preview["body"])
+        self.assertTrue(preview["body"].endswith("Anish Gogineni"))
         self.assertEqual(preview["provider"], "fallback")
 
         draft_id = self.repo.save_email_draft(
@@ -393,6 +576,7 @@ class StorageOutputTests(unittest.TestCase):
         self.assertNotIn(instruction, draft.body)
         self.assertEqual(draft.tone, "concise")
         self.assertIn("Keep Gmail draft-only", draft.body)
+        self.assertTrue(draft.body.endswith("Anish Gogineni"))
 
     def test_parse_email_content_from_llm_fixture(self) -> None:
         draft = parse_email_content(
@@ -408,6 +592,7 @@ class StorageOutputTests(unittest.TestCase):
         self.assertEqual(draft.subject, "Next steps from design review")
         self.assertEqual(draft.tone, "warm")
         self.assertEqual(draft.included_items, ["summary", "action_items"])
+        self.assertTrue(draft.body.endswith("Anish Gogineni"))
 
 
 class ExtractionParsingTests(unittest.TestCase):
@@ -426,6 +611,73 @@ class ExtractionParsingTests(unittest.TestCase):
         self.assertEqual(result.action_items[0].status, "open")
         self.assertEqual(result.commitments[0].text, "Follow up")
         self.assertEqual(result.raw, raw)
+
+    def test_parse_extraction_reads_relationships_and_implicit_followups(self) -> None:
+        raw = {
+            "summary": "Summary",
+            "relationships": [
+                {
+                    "source": "Alex",
+                    "source_kind": "person",
+                    "target": "DairyMGT",
+                    "target_kind": "project",
+                    "relationship_type": "owns_followup",
+                    "evidence": "Alex owns the launch.",
+                    "confidence": 0.9,
+                }
+            ],
+            "implicit_followups": [
+                {
+                    "task_text": "Send Alex the DairyMGT launch update",
+                    "implied_by": "Alex owns the launch.",
+                    "owed_to": "Alex",
+                    "project": "DairyMGT",
+                    "confidence": 0.8,
+                }
+            ],
+        }
+        result = parse_extraction(raw)
+
+        self.assertEqual(result.relationships[0].source, "Alex")
+        self.assertEqual(result.relationships[0].target_kind, "project")
+        self.assertEqual(result.implicit_followups[0].task_text, "Send Alex the DairyMGT launch update")
+        self.assertEqual(result.implicit_followups[0].project, "DairyMGT")
+
+    def test_relationship_inference_failure_keeps_main_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meeting = Meeting(id=1, title="Demo", started_at="2026-06-04T10:00:00Z")
+            settings = Settings(
+                db_path=root / "data" / "unused.db",
+                notes_dir=root / "notes",
+                audio_dir=root / "audio",
+                transcripts_dir=root / "transcripts",
+                state_path=root / "data" / "recording.json",
+                app_host="127.0.0.1",
+                app_port=8765,
+                record_cmd="",
+                capture_profile="mic",
+                input_device="",
+                whisper_cpp_bin="",
+                whisper_cpp_model="",
+                llm_provider="openai",
+                openai_api_key="key",
+                openai_model="gpt-4.1-mini",
+                anthropic_api_key="",
+                gmail_credentials_path=root / "data" / "google_credentials.json",
+                gmail_token_path=root / "data" / "google_token.json",
+                google_calendar_token_path=root / "data" / "google_calendar_token.json",
+            )
+            repo = Repository(settings.db_path)
+            repo.init()
+            extractor = Extractor(settings, repo)
+            result = ExtractionResult(summary="Main result", raw={"summary": "Main result"})
+
+            with patch.object(extractor, "_infer_relationships_openai", side_effect=RuntimeError("nope")):
+                merged = extractor._with_relationship_inference(meeting, "transcript", result)
+
+            self.assertEqual(merged.summary, "Main result")
+            self.assertIn("relationship_inference_error", merged.raw)
 
     def test_fallback_extract_creates_obvious_action_item(self) -> None:
         meeting = Meeting(id=1, title="DairyMGT", started_at="2026-06-03T21:18:16+00:00")

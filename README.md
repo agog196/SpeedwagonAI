@@ -26,6 +26,7 @@ speedwagon brief
 speedwagon calendar status
 speedwagon calendar sync
 speedwagon app
+speedwagon export --output data/exports/speedwagon-export.zip
 ```
 
 ## V1 Notes
@@ -46,6 +47,27 @@ speedwagon app
 ```
 
 The app runs at `http://127.0.0.1:8765` by default and uses the same local SQLite database as the CLI.
+
+Local API calls under `/api/*` require a bearer token in V18. Speedwagon creates one at `data/local_api_token` unless `SPEEDWAGON_API_TOKEN` is set. The bundled browser UI receives a local same-site cookie automatically; native/API clients send `Authorization: Bearer <token>`.
+
+V19 adds local beta privacy tools:
+
+```bash
+speedwagon export --output data/exports/speedwagon-export.zip
+speedwagon wipe --confirm DELETE-SPEEDWAGON-DATA
+```
+
+Export writes a zip with local Speedwagon data plus a manifest. Wipe deletes configured Speedwagon-owned local data directories/files after the exact confirmation phrase.
+
+V23 adds local beta readiness docs:
+
+- [Local beta privacy policy](docs/privacy-policy-local-beta.md)
+- [Local beta terms](docs/terms-local-beta.md)
+- [Native local app verification checklist](native/SpeedwagonAI/README.md#v25-local-app-verification-checklist)
+
+These beta docs are plain-language tester drafts. They explain local-first storage, explicit external-service use, Gmail draft-only behavior, export/wipe, and permission expectations.
+
+V25 adds native first-run readiness diagnostics for repo root, Python 3.11, backend command, bundle mode, notification status, and Keychain token/key presence. The Settings diagnostics report is designed to be copied for private beta support without exposing secrets. V26 adds opt-in Developer ID signing, notarization, stapling, and private-beta DMG scripts.
 
 ## Tasks
 
@@ -177,6 +199,16 @@ cd native/SpeedwagonAI
 swift run SpeedwagonAI
 ```
 
+For the V25 local beta `.app` shell:
+
+```bash
+cd native/SpeedwagonAI
+./scripts/build-local-app.sh
+SPEEDWAGON_REPO_ROOT="$(cd ../.. && pwd)" open dist/SpeedwagonAI.app
+```
+
+The local beta app can start and stop the Python backend it launches. It still expects Python 3.11 and this repo checkout to exist locally. The unsigned build is for local development; V26 signed/notarized DMG packaging is documented in the native README. macOS Keychain prompts ask for the tester's Mac login password so SpeedwagonAI can read or save its own local-beta secrets.
+
 The native palette opens from the menu bar, `Cmd+K` while the app is focused, or global `Option+Space`. It uses a floating `NSPanel` intended to appear over the current Space/full-screen app. In expanded mode, it includes meeting capture controls for `Native system + mic`, `Mic fallback`, Stop, and Stop + Process.
 
 You can also type capture commands in the native palette:
@@ -210,7 +242,7 @@ speedwagon gmail draft <meeting-id> \
   --instruction "Write a warm follow-up thanking them and listing next steps."
 ```
 
-Gmail remains draft-only; SpeedwagonAI does not send mail automatically.
+Gmail remains draft-only; SpeedwagonAI does not send mail automatically. Follow-through suggestions create editable local drafts first; creating the Gmail draft is a second explicit action after review.
 
 ## Meeting Audio With Headphones
 
@@ -296,7 +328,7 @@ speedwagon bot process <session-id>
 
 ## Google Calendar
 
-V16 adds a read-only Google Calendar cache for daily brief and meeting-prep context. It reuses the existing Google OAuth client credentials, keeps a dedicated Calendar token, and stores a limited rolling window locally in SQLite plus raw event JSON under `data/calendar/`.
+Google Calendar support syncs a local rolling event cache for daily brief and meeting-prep context. It also supports explicit user-triggered event creation. SpeedwagonAI does not edit/delete events, schedule bots from Calendar, or write reminders.
 
 Add optional Calendar settings:
 
@@ -314,15 +346,19 @@ pip install -e ".[google]"
 speedwagon calendar status
 speedwagon calendar sync
 speedwagon calendar upcoming
+speedwagon calendar create --title "Pilot planning" --start "2026-06-08T10:00:00-07:00" --end "2026-06-08T10:30:00-07:00" --attendee alex@example.com --confirm-write
 speedwagon ask "what is on my calendar today"
 speedwagon ask "prep for my next meeting"
+speedwagon ask "create a calendar event for June 10th at 10am to wish a happy birthday to Raj"
 ```
 
-Calendar is read-only in V16. It does not create events, schedule bots, or write reminders. Calendar uses the same Google OAuth client credentials as Gmail, but stores its own token at `data/google_calendar_token.json` so Calendar and Gmail do not fight over scopes. If you previously tried Calendar sync before this split, delete `data/google_calendar_token.json` and run `speedwagon calendar sync` again.
+Calendar uses the same Google OAuth client credentials as Gmail, but stores its own token at `data/google_calendar_token.json` so Calendar and Gmail do not fight over scopes. If your token was created when Calendar was read-only, creating an event may require deleting `data/google_calendar_token.json` or re-authorizing so Google grants `https://www.googleapis.com/auth/calendar.events`.
+
+Assistant-created Calendar events are confirmation-first. The assistant creates a pending action; the Google Calendar write only happens after you confirm it.
 
 ## Cost Controls
 
-SpeedwagonAI routes routine extraction, email drafting, command parsing, screenshot analysis, web search, and deeper synthesis through operation-specific model choices. Optional environment overrides:
+SpeedwagonAI routes routine extraction, relationship inference, email drafting, command parsing, screenshot analysis, web search, and deeper synthesis through operation-specific model choices. Relationship inference uses the cheap model tier by default and runs best-effort after meeting extraction. Optional environment overrides:
 
 ```env
 SPEEDWAGON_MODEL_CHEAP=gpt-4.1-mini
@@ -334,5 +370,7 @@ SPEEDWAGON_ENABLE_WEB_SEARCH=false
 ```
 
 Web search only triggers for explicit requests like `search the web for ...` or `latest ...`. It is disabled unless `SPEEDWAGON_ENABLE_WEB_SEARCH=true`, and V12 still treats web search as a gated summary path rather than an action-taking agent.
+
+Daily intelligence is also explicit: `speedwagon intelligence refresh` or the native “Refresh Intelligence” button updates the cached synthesis and top suggestion narratives. Opening the daily brief reads cached data and does not trigger a model call.
 
 The deployable Mac app direction should store user API keys in macOS Keychain; `.env` remains the local developer setup.

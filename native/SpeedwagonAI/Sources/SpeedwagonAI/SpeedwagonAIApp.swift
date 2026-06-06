@@ -97,6 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activateSpeedwagon()
         return true
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AppState.shared.stopManagedBackend()
+    }
 }
 
 extension AppDelegate: UNUserNotificationCenterDelegate {
@@ -104,10 +108,15 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
+        let suggestionId = response.notification.request.content.userInfo["suggestion_id"] as? Int
         await MainActor.run {
             activateSpeedwagon()
             Task {
-                await AppState.shared.refreshAll(updateStatus: false)
+                if let suggestionId {
+                    await AppState.shared.openSuggestionFromNotification(id: suggestionId)
+                } else {
+                    await AppState.shared.refreshAll(updateStatus: false)
+                }
             }
         }
     }

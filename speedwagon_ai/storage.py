@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from speedwagon_ai.models import ExtractedItem, ExtractionResult, Meeting
+from speedwagon_ai.models import ExtractedFollowup, ExtractedItem, ExtractedRelationship, ExtractionResult, Meeting
 from speedwagon_ai.timeutil import utc_now_iso
 
 
@@ -93,6 +93,23 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS followup_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    suggestion_id INTEGER REFERENCES suggestions(id) ON DELETE SET NULL,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    context_id INTEGER REFERENCES contexts(id) ON DELETE SET NULL,
+    meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL DEFAULT 'local',
+    provider_draft_id TEXT,
+    recipient TEXT,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'local',
+    source TEXT NOT NULL DEFAULT 'suggestion',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL,
@@ -160,6 +177,11 @@ CREATE TABLE IF NOT EXISTS contexts (
     name TEXT NOT NULL,
     normalized_name TEXT NOT NULL UNIQUE,
     kind TEXT NOT NULL DEFAULT 'topic',
+    profile_email TEXT,
+    profile_phone TEXT,
+    profile_role TEXT,
+    profile_company TEXT,
+    profile_notes TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -175,6 +197,18 @@ CREATE TABLE IF NOT EXISTS context_links (
     confidence REAL NOT NULL DEFAULT 0.7,
     reason TEXT,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_context_id INTEGER NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+    target_context_id INTEGER NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+    relationship_type TEXT NOT NULL DEFAULT 'related',
+    evidence TEXT,
+    confidence REAL NOT NULL DEFAULT 0.7,
+    source_meeting_id INTEGER REFERENCES meetings(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -253,12 +287,28 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     UNIQUE(provider, calendar_id, provider_event_id)
 );
 
+CREATE TABLE IF NOT EXISTS daily_syntheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    synthesis_date TEXT NOT NULL UNIQUE,
+    summary TEXT NOT NULL,
+    risks_json TEXT NOT NULL DEFAULT '[]',
+    dropped_threads_json TEXT NOT NULL DEFAULT '[]',
+    followups_json TEXT NOT NULL DEFAULT '[]',
+    recent_changes_json TEXT NOT NULL DEFAULT '[]',
+    provider TEXT NOT NULL DEFAULT 'fallback',
+    model TEXT,
+    generated_at TEXT NOT NULL,
+    input_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_calendar_events_start_at ON calendar_events(start_at);
 CREATE INDEX IF NOT EXISTS idx_calendar_events_provider_event ON calendar_events(provider, calendar_id, provider_event_id);
 """
 
 ACTIVE_TASK_STATUSES = {"open", "waiting", "snoozed", "uncertain"}
-FINAL_TASK_STATUSES = {"done", "canceled"}
+FINAL_TASK_STATUSES = {"done", "canceled", "archived"}
 TASK_STATUSES = ACTIVE_TASK_STATUSES | FINAL_TASK_STATUSES
 SOURCE_TYPES = {
     "local_recording",
@@ -306,11 +356,36 @@ class Repository:
             self._ensure_column(conn, "suggestions", "last_notified_at", "TEXT")
             self._ensure_column(conn, "suggestions", "notification_reason", "TEXT")
             self._ensure_column(conn, "suggestions", "notification_status", "TEXT")
+            self._ensure_column(conn, "contexts", "profile_email", "TEXT")
+            self._ensure_column(conn, "contexts", "profile_phone", "TEXT")
+            self._ensure_column(conn, "contexts", "profile_role", "TEXT")
+            self._ensure_column(conn, "contexts", "profile_company", "TEXT")
+            self._ensure_column(conn, "contexts", "profile_notes", "TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_suggestions_source_fingerprint ON suggestions(source_fingerprint)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_suggestions_notification_status ON suggestions(notification_status)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_suggestion_notifications_suggestion "
                 "ON suggestion_notifications(suggestion_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_followup_drafts_suggestion "
+                "ON followup_drafts(suggestion_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_context_relationships_source "
+                "ON context_relationships(source_context_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_context_relationships_target "
+                "ON context_relationships(target_context_id)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_relationships_unique "
+                "ON context_relationships(source_context_id, target_context_id, relationship_type, coalesce(source_meeting_id, -1))"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_syntheses_date "
+                "ON daily_syntheses(synthesis_date)"
             )
             self.sync_tasks_from_existing_work(conn)
         self.refresh_all_contexts()
@@ -391,6 +466,7 @@ class Repository:
         with self.connect() as conn:
             for table in ["action_items", "commitments", "decisions", "open_questions", "key_topics", "entities"]:
                 conn.execute(f"DELETE FROM {table} WHERE meeting_id = ?", (meeting_id,))
+            conn.execute("DELETE FROM context_relationships WHERE source_meeting_id = ?", (meeting_id,))
             conn.execute(
                 """
                 UPDATE meetings
@@ -422,6 +498,8 @@ class Repository:
         for task in self.list_tasks_for_meeting(meeting_id):
             self.refresh_task_contexts(int(task["id"]))
             self.generate_suggestions_for_task(int(task["id"]))
+        self.save_extracted_relationships(meeting_id, result.relationships)
+        self.create_implicit_followup_suggestions(meeting_id, result.implicit_followups)
 
     def meeting_bundle(self, meeting_id: int) -> dict[str, Any]:
         meeting = self.get_meeting(meeting_id)
@@ -434,6 +512,7 @@ class Repository:
                 "open_questions": self._rows(conn, "open_questions", meeting_id),
                 "key_topics": self._rows(conn, "key_topics", meeting_id),
                 "entities": self._rows(conn, "entities", meeting_id),
+                "relationships": self.relationships_for_meeting(meeting_id),
             }
 
     def unresolved_work(self) -> list[dict[str, Any]]:
@@ -611,6 +690,19 @@ class Repository:
         self.generate_suggestions_for_task(task_id)
         return self.get_task(task_id)
 
+    def clear_done_tasks(self) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'archived', updated_at = ?
+                WHERE status = 'done'
+                """,
+                (now,),
+            )
+            return int(cur.rowcount or 0)
+
     def update_task_status(
         self,
         task_id: int,
@@ -747,8 +839,82 @@ class Repository:
         ]
         brief["meeting_prep"] = [self.meeting_prep_for_event(event) for event in brief["calendar_upcoming"][:5]]
         brief["notification_candidates"] = self.notification_candidates(limit=10)
+        brief["synthesis"] = self.get_daily_synthesis(today_iso)
         brief["counts"] = {key: len(value) for key, value in brief.items() if isinstance(value, list)}
         return brief
+
+    def get_daily_synthesis(self, synthesis_date: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_syntheses WHERE synthesis_date = ?",
+                (synthesis_date,),
+            ).fetchone()
+        return self._daily_synthesis_dict(row) if row else None
+
+    def latest_daily_synthesis(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_syntheses ORDER BY synthesis_date DESC, updated_at DESC LIMIT 1"
+            ).fetchone()
+        return self._daily_synthesis_dict(row) if row else None
+
+    def save_daily_synthesis(
+        self,
+        *,
+        synthesis_date: str,
+        summary: str,
+        risks: list[str] | None = None,
+        dropped_threads: list[str] | None = None,
+        followups: list[str] | None = None,
+        recent_changes: list[str] | None = None,
+        provider: str = "fallback",
+        model: str | None = None,
+        generated_at: str | None = None,
+        input_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        generated = generated_at or now
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_syntheses (
+                    synthesis_date, summary, risks_json, dropped_threads_json, followups_json,
+                    recent_changes_json, provider, model, generated_at, input_fingerprint,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(synthesis_date)
+                DO UPDATE SET
+                    summary = excluded.summary,
+                    risks_json = excluded.risks_json,
+                    dropped_threads_json = excluded.dropped_threads_json,
+                    followups_json = excluded.followups_json,
+                    recent_changes_json = excluded.recent_changes_json,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    generated_at = excluded.generated_at,
+                    input_fingerprint = excluded.input_fingerprint,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    synthesis_date,
+                    summary,
+                    json.dumps(risks or [], sort_keys=True),
+                    json.dumps(dropped_threads or [], sort_keys=True),
+                    json.dumps(followups or [], sort_keys=True),
+                    json.dumps(recent_changes or [], sort_keys=True),
+                    provider,
+                    _optional(model),
+                    generated,
+                    _optional(input_fingerprint),
+                    now,
+                    now,
+                ),
+            )
+        synthesis = self.get_daily_synthesis(synthesis_date)
+        if synthesis is None:
+            raise RuntimeError("Daily synthesis save failed")
+        return synthesis
 
     def upsert_calendar_event(self, event: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
@@ -844,6 +1010,35 @@ class Repository:
                 [*params, limit],
             ).fetchall()
         return [self._calendar_event_dict(row) for row in rows]
+
+    def remove_calendar_events_missing_from_sync(
+        self,
+        *,
+        provider: str,
+        calendar_id: str,
+        start_at: str,
+        end_at: str,
+        seen_provider_event_ids: set[str],
+    ) -> int:
+        params: list[Any] = [provider, calendar_id, start_at, end_at]
+        where_missing = ""
+        if seen_provider_event_ids:
+            placeholders = ",".join("?" for _ in seen_provider_event_ids)
+            where_missing = f"AND provider_event_id NOT IN ({placeholders})"
+            params.extend(sorted(seen_provider_event_ids))
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM calendar_events
+                WHERE provider = ?
+                  AND calendar_id = ?
+                  AND start_at >= ?
+                  AND start_at < ?
+                  {where_missing}
+                """,
+                params,
+            )
+            return int(cursor.rowcount or 0)
 
     def upcoming_calendar_events(self, *, limit: int = 10, from_date: str | None = None) -> list[dict[str, Any]]:
         start = from_date or date.today().isoformat()
@@ -947,6 +1142,141 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def create_followup_draft(
+        self,
+        *,
+        subject: str,
+        body: str,
+        recipient: str | None = None,
+        suggestion_id: int | None = None,
+        task_id: int | None = None,
+        context_id: int | None = None,
+        meeting_id: int | None = None,
+        source: str = "suggestion",
+    ) -> dict[str, Any]:
+        if suggestion_id:
+            existing = self.followup_draft_for_suggestion(suggestion_id)
+            if existing:
+                return existing
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO followup_drafts (
+                    suggestion_id, task_id, context_id, meeting_id, recipient, subject,
+                    body, source, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    suggestion_id,
+                    task_id,
+                    context_id,
+                    meeting_id,
+                    _optional(recipient),
+                    subject.strip() or "Follow-up",
+                    body,
+                    source,
+                    now,
+                    now,
+                ),
+            )
+            draft_id = int(cur.lastrowid)
+        return self.get_followup_draft(draft_id)
+
+    def followup_draft_for_suggestion(self, suggestion_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT followup_drafts.*, contexts.name AS context_name, tasks.text AS task_text, meetings.title AS meeting_title
+                FROM followup_drafts
+                LEFT JOIN contexts ON contexts.id = followup_drafts.context_id
+                LEFT JOIN tasks ON tasks.id = followup_drafts.task_id
+                LEFT JOIN meetings ON meetings.id = followup_drafts.meeting_id
+                WHERE followup_drafts.suggestion_id = ?
+                ORDER BY followup_drafts.created_at DESC, followup_drafts.id DESC
+                LIMIT 1
+                """,
+                (suggestion_id,),
+            ).fetchone()
+        return self._followup_draft_dict(row) if row else None
+
+    def get_followup_draft(self, draft_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT followup_drafts.*, contexts.name AS context_name, tasks.text AS task_text, meetings.title AS meeting_title
+                FROM followup_drafts
+                LEFT JOIN contexts ON contexts.id = followup_drafts.context_id
+                LEFT JOIN tasks ON tasks.id = followup_drafts.task_id
+                LEFT JOIN meetings ON meetings.id = followup_drafts.meeting_id
+                WHERE followup_drafts.id = ?
+                """,
+                (draft_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Follow-up draft {draft_id} not found")
+        return self._followup_draft_dict(row)
+
+    def list_followup_drafts(self, status: str | None = "local", limit: int = 20) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if status:
+            where = "WHERE followup_drafts.status = ?"
+            params.append(status)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT followup_drafts.*, contexts.name AS context_name, tasks.text AS task_text, meetings.title AS meeting_title
+                FROM followup_drafts
+                LEFT JOIN contexts ON contexts.id = followup_drafts.context_id
+                LEFT JOIN tasks ON tasks.id = followup_drafts.task_id
+                LEFT JOIN meetings ON meetings.id = followup_drafts.meeting_id
+                {where}
+                ORDER BY followup_drafts.updated_at DESC, followup_drafts.id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._followup_draft_dict(row) for row in rows]
+
+    def update_followup_draft(
+        self,
+        draft_id: int,
+        *,
+        recipient: str | None = None,
+        subject: str | None = None,
+        body: str | None = None,
+        status: str | None = None,
+        provider: str | None = None,
+        provider_draft_id: str | None = None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if recipient is not None:
+            fields["recipient"] = _optional(recipient)
+        if subject is not None:
+            fields["subject"] = subject.strip() or "Follow-up"
+        if body is not None:
+            fields["body"] = body
+        if status is not None:
+            normalized = status.strip().lower()
+            if normalized not in {"local", "gmail_draft", "dismissed"}:
+                raise ValueError(f"Unsupported follow-up draft status: {status}")
+            fields["status"] = normalized
+        if provider is not None:
+            fields["provider"] = provider
+        if provider_draft_id is not None:
+            fields["provider_draft_id"] = provider_draft_id
+        if not fields:
+            return self.get_followup_draft(draft_id)
+        fields["updated_at"] = utc_now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [draft_id]
+        with self.connect() as conn:
+            conn.execute(f"UPDATE followup_drafts SET {assignments} WHERE id = ?", values)
+        return self.get_followup_draft(draft_id)
+
     def create_bot_session(
         self,
         *,
@@ -1046,6 +1376,14 @@ class Repository:
                 params,
             ).fetchall()
         return [self._bot_session_dict(row) for row in rows]
+
+    def clear_bot_sessions(self, status: str | None = None) -> int:
+        with self.connect() as conn:
+            if status:
+                cur = conn.execute("DELETE FROM bot_sessions WHERE status = ?", (status,))
+            else:
+                cur = conn.execute("DELETE FROM bot_sessions")
+            return int(cur.rowcount if cur.rowcount is not None else 0)
 
     def update_bot_session(self, session_id: int, **fields: Any) -> dict[str, Any]:
         allowed = {
@@ -1188,6 +1526,42 @@ class Repository:
             raise KeyError(f"Context {context_id} not found")
         return dict(row)
 
+    def update_context_profile(
+        self,
+        context_id: int,
+        *,
+        email: str | None = None,
+        phone: str | None = None,
+        role: str | None = None,
+        company: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_context(context_id)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE contexts
+                SET profile_email = ?,
+                    profile_phone = ?,
+                    profile_role = ?,
+                    profile_company = ?,
+                    profile_notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    _optional(email),
+                    _optional(phone),
+                    _optional(role),
+                    _optional(company),
+                    _optional(notes),
+                    now,
+                    context_id,
+                ),
+            )
+        return self.get_context(context_id)
+
     def find_contexts(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = ""
@@ -1271,6 +1645,159 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def link_context_relationship(
+        self,
+        source_context_id: int,
+        target_context_id: int,
+        *,
+        relationship_type: str = "related",
+        evidence: str | None = None,
+        confidence: float = 0.7,
+        source_meeting_id: int | None = None,
+    ) -> dict[str, Any]:
+        if source_context_id == target_context_id:
+            raise ValueError("Relationship endpoints must be different contexts")
+        relationship_type = clean_relationship_type(relationship_type)
+        confidence = max(0.0, min(1.0, float(confidence)))
+        now = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM context_relationships
+                WHERE source_context_id = ?
+                  AND target_context_id = ?
+                  AND relationship_type = ?
+                  AND coalesce(source_meeting_id, -1) = ?
+                """,
+                (source_context_id, target_context_id, relationship_type, source_meeting_id if source_meeting_id is not None else -1),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE context_relationships
+                    SET evidence = ?, confidence = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_optional(evidence), confidence, now, row["id"]),
+                )
+                relationship_id = int(row["id"])
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO context_relationships (
+                        source_context_id, target_context_id, relationship_type, evidence,
+                        confidence, source_meeting_id, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_context_id,
+                        target_context_id,
+                        relationship_type,
+                        _optional(evidence),
+                        confidence,
+                        source_meeting_id,
+                        now,
+                        now,
+                    ),
+                )
+                relationship_id = int(cur.lastrowid)
+        return self.get_context_relationship(relationship_id)
+
+    def get_context_relationship(self, relationship_id: int) -> dict[str, Any]:
+        relationships = self._context_relationship_rows("context_relationships.id = ?", [relationship_id])
+        if not relationships:
+            raise KeyError(f"Context relationship {relationship_id} not found")
+        return relationships[0]
+
+    def save_extracted_relationships(self, meeting_id: int, relationships: list[ExtractedRelationship]) -> list[dict[str, Any]]:
+        saved: list[dict[str, Any]] = []
+        for relationship in relationships:
+            if not relationship.source or not relationship.target:
+                continue
+            try:
+                source = self.ensure_context(relationship.source, kind=relationship.source_kind)
+                target = self.ensure_context(relationship.target, kind=relationship.target_kind)
+                saved.append(
+                    self.link_context_relationship(
+                        int(source["id"]),
+                        int(target["id"]),
+                        relationship_type=relationship.relationship_type,
+                        evidence=relationship.evidence,
+                        confidence=relationship.confidence,
+                        source_meeting_id=meeting_id,
+                    )
+                )
+            except ValueError:
+                continue
+        return saved
+
+    def create_implicit_followup_suggestions(self, meeting_id: int, followups: list[ExtractedFollowup]) -> list[dict[str, Any]]:
+        suggestions: list[dict[str, Any]] = []
+        for followup in followups:
+            text = followup.task_text.strip()
+            if not text:
+                continue
+            context_id: int | None = None
+            if followup.project:
+                context_id = int(self.ensure_context(followup.project, kind="project")["id"])
+            elif followup.owed_to:
+                context_id = int(self.ensure_context(followup.owed_to, kind="person")["id"])
+            elif followup.owner:
+                context_id = int(self.ensure_context(followup.owner, kind="person")["id"])
+            payload = {
+                "text": text,
+                "owner": followup.owner,
+                "owed_to": followup.owed_to,
+                "project": followup.project,
+                "due_date": followup.due_date,
+                "source": "implicit_followup",
+                "source_type": "manual",
+                "source_meeting_id": meeting_id,
+                "source_followup_fingerprint": (
+                    f"{meeting_id}:{(followup.project or '').lower()}:"
+                    f"{(followup.owed_to or '').lower()}:{(followup.owner or '').lower()}:"
+                    f"{text.lower()}:{(followup.due_date or '').lower()}"
+                ),
+            }
+            payload = {key: value for key, value in payload.items() if value not in {None, ""}}
+            suggestions.append(
+                self.create_suggestion(
+                    title=f"Add inferred follow-up from meeting #{meeting_id}",
+                    reason=followup.implied_by or "The meeting implied follow-up work that was not an explicit task.",
+                    proposed_action="add_task",
+                    payload=payload,
+                    confidence=followup.confidence,
+                    context_id=context_id,
+                    meeting_ids=[meeting_id],
+                )
+            )
+        return suggestions
+
+    def relationships_for_meeting(self, meeting_id: int) -> list[dict[str, Any]]:
+        return self._context_relationship_rows("context_relationships.source_meeting_id = ?", [meeting_id])
+
+    def relationships_for_contexts(self, context_ids: list[int], limit: int = 40) -> list[dict[str, Any]]:
+        if not context_ids:
+            return []
+        placeholders = ",".join("?" for _ in context_ids)
+        return self._context_relationship_rows(
+            f"(context_relationships.source_context_id IN ({placeholders}) OR context_relationships.target_context_id IN ({placeholders}))",
+            [*context_ids, *context_ids],
+            limit=limit,
+        )
+
+    def related_context_ids(self, context_ids: list[int]) -> list[int]:
+        related: set[int] = set(context_ids)
+        for relationship in self.relationships_for_contexts(context_ids, limit=100):
+            source = relationship.get("source_context") or {}
+            target = relationship.get("target_context") or {}
+            if source.get("id"):
+                related.add(int(source["id"]))
+            if target.get("id"):
+                related.add(int(target["id"]))
+        return sorted(related)
+
     def refresh_meeting_contexts(self, meeting_id: int) -> None:
         meeting = self.get_meeting(meeting_id)
         candidates: list[tuple[str, str, float, str]] = []
@@ -1352,7 +1879,21 @@ class Repository:
         if not contexts and query.strip():
             needle = query.strip().lower()
             contexts = [context for context in self.find_contexts(limit=50) if needle in context["name"].lower()]
-        context_ids = [int(context["id"]) for context in contexts]
+        seed_context_ids = [int(context["id"]) for context in contexts]
+        relationships = self.relationships_for_contexts(seed_context_ids, limit=max(limit * 2, 20))
+        context_ids = self.related_context_ids(seed_context_ids)
+        if context_ids and len(context_ids) > len(seed_context_ids):
+            existing_ids = {int(context["id"]) for context in contexts}
+            placeholders = ",".join("?" for _ in context_ids)
+            with self.connect() as conn:
+                related_rows = conn.execute(
+                    f"SELECT * FROM contexts WHERE id IN ({placeholders}) ORDER BY updated_at DESC, name",
+                    context_ids,
+                ).fetchall()
+            for row in related_rows:
+                if int(row["id"]) not in existing_ids:
+                    contexts.append(dict(row))
+                    existing_ids.add(int(row["id"]))
         tasks: list[dict[str, Any]] = []
         meetings: list[dict[str, Any]] = []
         if context_ids:
@@ -1394,8 +1935,180 @@ class Repository:
             "contexts": contexts,
             "tasks": tasks,
             "meetings": meetings,
+            "relationships": relationships,
             "suggestions": self.list_suggestions(status="open"),
         }
+
+    def context_detail(self, context_id: int, limit: int = 40) -> dict[str, Any]:
+        context = self.get_context(context_id)
+        relationship_context_ids = self.related_context_ids([context_id])
+        context_ids = relationship_context_ids or [context_id]
+        relationships = self.relationships_for_contexts([context_id], limit=limit)
+        related_contexts = [item for item in self.contexts_by_ids(context_ids) if int(item["id"]) != context_id]
+        tasks = self.tasks_for_context_ids(context_ids, include_done=True, limit=limit)
+        meetings = self.meetings_for_context_ids(context_ids, limit=limit)
+        decisions = self.decisions_for_context_ids(context_ids, limit=limit)
+        task_ids = {int(task["id"]) for task in tasks}
+        meeting_ids = {int(meeting["id"]) for meeting in meetings}
+        suggestions = self.suggestions_for_review_context(context_ids, task_ids, meeting_ids, limit=limit)
+        suggestion_ids = {int(suggestion["id"]) for suggestion in suggestions}
+        followup_drafts = self.followup_drafts_for_review_context(
+            context_ids,
+            task_ids,
+            meeting_ids,
+            suggestion_ids,
+            limit=limit,
+        )
+        return {
+            "context": context,
+            "related_contexts": related_contexts,
+            "relationships": relationships,
+            "tasks": tasks,
+            "meetings": meetings,
+            "decisions": decisions,
+            "suggestions": suggestions,
+            "followup_drafts": followup_drafts,
+        }
+
+    def contexts_by_ids(self, context_ids: list[int]) -> list[dict[str, Any]]:
+        if not context_ids:
+            return []
+        placeholders = ",".join("?" for _ in context_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM contexts WHERE id IN ({placeholders}) ORDER BY kind, name",
+                context_ids,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def tasks_for_context_ids(self, context_ids: list[int], *, include_done: bool = False, limit: int = 40) -> list[dict[str, Any]]:
+        if not context_ids:
+            return []
+        placeholders = ",".join("?" for _ in context_ids)
+        where = "" if include_done else "AND tasks.status NOT IN ('done', 'canceled')"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT
+                    tasks.*,
+                    tasks.source AS kind,
+                    tasks.due_date AS deadline,
+                    tasks.source_meeting_id AS meeting_id,
+                    meetings.title AS meeting_title,
+                    meetings.started_at
+                FROM context_links
+                JOIN tasks ON tasks.id = context_links.task_id
+                LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+                WHERE context_links.context_id IN ({placeholders})
+                {where}
+                ORDER BY tasks.status = 'done', tasks.due_date IS NULL, tasks.due_date, tasks.updated_at DESC
+                LIMIT ?
+                """,
+                [*context_ids, limit],
+            ).fetchall()
+        return [self._task_with_contexts(row) for row in rows]
+
+    def meetings_for_context_ids(self, context_ids: list[int], *, limit: int = 40) -> list[dict[str, Any]]:
+        if not context_ids:
+            return []
+        placeholders = ",".join("?" for _ in context_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT meetings.id, meetings.title, meetings.started_at, meetings.ended_at,
+                       meetings.summary, meetings.source_type
+                FROM context_links
+                JOIN meetings ON meetings.id = context_links.meeting_id
+                WHERE context_links.context_id IN ({placeholders})
+                ORDER BY meetings.started_at DESC, meetings.id DESC
+                LIMIT ?
+                """,
+                [*context_ids, limit],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def decisions_for_context_ids(self, context_ids: list[int], *, limit: int = 40) -> list[dict[str, Any]]:
+        if not context_ids:
+            return []
+        placeholders = ",".join("?" for _ in context_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT decisions.*, meetings.title AS meeting_title
+                FROM context_links
+                JOIN decisions ON decisions.meeting_id = context_links.meeting_id
+                JOIN meetings ON meetings.id = decisions.meeting_id
+                WHERE context_links.context_id IN ({placeholders})
+                ORDER BY decisions.created_at DESC, decisions.id DESC
+                LIMIT ?
+                """,
+                [*context_ids, limit],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def suggestions_for_review_context(
+        self,
+        context_ids: list[int],
+        task_ids: set[int],
+        meeting_ids: set[int],
+        *,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        context_set = {int(item) for item in context_ids}
+        output: list[dict[str, Any]] = []
+        for suggestion in self.list_suggestions(status=None, limit=max(limit * 4, 100)):
+            suggestion_context_id = suggestion.get("context_id")
+            if suggestion_context_id and int(suggestion_context_id) in context_set:
+                output.append(suggestion)
+                continue
+            if task_ids & {int(item) for item in suggestion.get("task_ids") or []}:
+                output.append(suggestion)
+                continue
+            if meeting_ids & {int(item) for item in suggestion.get("meeting_ids") or []}:
+                output.append(suggestion)
+                continue
+        return output[:limit]
+
+    def followup_drafts_for_review_context(
+        self,
+        context_ids: list[int],
+        task_ids: set[int],
+        meeting_ids: set[int],
+        suggestion_ids: set[int],
+        *,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        for column, values in [
+            ("followup_drafts.context_id", set(context_ids)),
+            ("followup_drafts.task_id", task_ids),
+            ("followup_drafts.meeting_id", meeting_ids),
+            ("followup_drafts.suggestion_id", suggestion_ids),
+        ]:
+            if not values:
+                continue
+            placeholders = ",".join("?" for _ in values)
+            conditions.append(f"{column} IN ({placeholders})")
+            params.extend(sorted(values))
+        if not conditions:
+            return []
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT followup_drafts.*, contexts.name AS context_name, tasks.text AS task_text, meetings.title AS meeting_title
+                FROM followup_drafts
+                LEFT JOIN contexts ON contexts.id = followup_drafts.context_id
+                LEFT JOIN tasks ON tasks.id = followup_drafts.task_id
+                LEFT JOIN meetings ON meetings.id = followup_drafts.meeting_id
+                WHERE {' OR '.join(conditions)}
+                ORDER BY followup_drafts.updated_at DESC, followup_drafts.id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._followup_draft_dict(row) for row in rows]
 
     def create_suggestion(
         self,
@@ -1421,6 +2134,7 @@ class Repository:
             meeting_ids=meeting_ids or [],
         )
         notification_reason = notification_reason_for_suggestion(title, reason, proposed_action)
+        next_notify_at = date.today().isoformat()
         with self.connect() as conn:
             row = conn.execute(
                 """
@@ -1453,7 +2167,7 @@ class Repository:
                     task_ids_json,
                     meeting_ids_json,
                     source_fingerprint,
-                    now,
+                    next_notify_at,
                     notification_reason,
                     now,
                     now,
@@ -1503,15 +2217,16 @@ class Repository:
 
     def update_suggestion_status(self, suggestion_id: int, status: str, snoozed_until: str | None = None) -> dict[str, Any]:
         normalized = status.strip().lower()
-        if normalized not in {"open", "accepted", "dismissed", "snoozed", "retired"}:
+        if normalized not in {"open", "accepted", "dismissed", "snoozed", "retired", "archived"}:
             raise ValueError(f"Unsupported suggestion status: {status}")
         now = utc_now_iso()
-        retired_at = now if normalized == "retired" else None
+        retired_at = now if normalized in {"retired", "archived"} else None
         notification_status = {
             "accepted": "accepted",
             "dismissed": "dismissed",
             "snoozed": "snoozed",
             "retired": "retired",
+            "archived": "archived",
         }.get(normalized)
         with self.connect() as conn:
             conn.execute(
@@ -1526,6 +2241,36 @@ class Repository:
                 WHERE id = ?
                 """,
                 (normalized, _optional(snoozed_until), retired_at, notification_status, normalized, now, suggestion_id),
+            )
+        return self.get_suggestion(suggestion_id)
+
+    def clear_reviewed_suggestions(self) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE suggestions
+                SET status = 'archived',
+                    notification_status = 'archived',
+                    retired_at = COALESCE(retired_at, ?),
+                    next_notify_at = NULL,
+                    updated_at = ?
+                WHERE status IN ('accepted', 'dismissed', 'retired')
+                """,
+                (now, now),
+            )
+        return int(cur.rowcount or 0)
+
+    def update_suggestion_narrative(self, suggestion_id: int, notification_reason: str) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE suggestions
+                SET notification_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (notification_reason.strip(), now, suggestion_id),
             )
         return self.get_suggestion(suggestion_id)
 
@@ -1772,7 +2517,7 @@ class Repository:
     def generate_context_suggestions(self, context_id: int) -> list[dict[str, Any]]:
         context = self.get_context(context_id)
         tasks = self.tasks_for_context(context_id, include_done=True)
-        active = [task for task in tasks if task.get("status") not in FINAL_TASK_STATUSES]
+        active = [task for task in tasks if task.get("status") not in FINAL_TASK_STATUSES and task.get("status") != "snoozed"]
         all_email_tasks = [task for task in active if is_followup_task(str(task.get("text") or ""))]
         email_tasks = [
             task
@@ -1910,6 +2655,29 @@ class Repository:
                 LIMIT ?
                 """,
                 params,
+            ).fetchall()
+        return [self._task_with_contexts(row) for row in rows]
+
+    def get_tasks_by_ids(self, task_ids: list[int]) -> list[dict[str, Any]]:
+        if not task_ids:
+            return []
+        placeholders = ",".join("?" for _ in task_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    tasks.*,
+                    tasks.source AS kind,
+                    tasks.due_date AS deadline,
+                    tasks.source_meeting_id AS meeting_id,
+                    meetings.title AS meeting_title,
+                    meetings.started_at
+                FROM tasks
+                LEFT JOIN meetings ON meetings.id = tasks.source_meeting_id
+                WHERE tasks.id IN ({placeholders})
+                ORDER BY tasks.id
+                """,
+                task_ids,
             ).fetchall()
         return [self._task_with_contexts(row) for row in rows]
 
@@ -2072,6 +2840,56 @@ class Repository:
     def _context_link_dict(row: sqlite3.Row) -> dict[str, Any]:
         return dict(row)
 
+    def _context_relationship_rows(
+        self,
+        where: str,
+        params: list[Any],
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        query_params = [*params, limit] if limit is not None else params
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    context_relationships.*,
+                    source_context.name AS source_context_name,
+                    source_context.normalized_name AS source_context_normalized_name,
+                    source_context.kind AS source_context_kind,
+                    target_context.name AS target_context_name,
+                    target_context.normalized_name AS target_context_normalized_name,
+                    target_context.kind AS target_context_kind,
+                    meetings.title AS source_meeting_title
+                FROM context_relationships
+                JOIN contexts AS source_context ON source_context.id = context_relationships.source_context_id
+                JOIN contexts AS target_context ON target_context.id = context_relationships.target_context_id
+                LEFT JOIN meetings ON meetings.id = context_relationships.source_meeting_id
+                WHERE {where}
+                ORDER BY context_relationships.confidence DESC, context_relationships.updated_at DESC, context_relationships.id DESC
+                {limit_sql}
+                """,
+                query_params,
+            ).fetchall()
+        return [self._context_relationship_dict(row) for row in rows]
+
+    @staticmethod
+    def _context_relationship_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["source_context"] = {
+            "id": item.pop("source_context_id"),
+            "name": item.pop("source_context_name"),
+            "normalized_name": item.pop("source_context_normalized_name"),
+            "kind": item.pop("source_context_kind"),
+        }
+        item["target_context"] = {
+            "id": item.pop("target_context_id"),
+            "name": item.pop("target_context_name"),
+            "normalized_name": item.pop("target_context_normalized_name"),
+            "kind": item.pop("target_context_kind"),
+        }
+        return item
+
     @staticmethod
     def _suggestion_dict(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
@@ -2098,6 +2916,10 @@ class Repository:
         return item
 
     @staticmethod
+    def _followup_draft_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    @staticmethod
     def _bot_session_dict(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["consent_confirmed"] = bool(item.get("consent_confirmed"))
@@ -2112,6 +2934,22 @@ class Repository:
             item["attendees"] = json.loads(item.pop("attendees_json") or "[]")
         except json.JSONDecodeError:
             item["attendees"] = []
+        return item
+
+    @staticmethod
+    def _daily_synthesis_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["date"] = item.pop("synthesis_date")
+        for json_key, public_key in [
+            ("risks_json", "risks"),
+            ("dropped_threads_json", "dropped_threads"),
+            ("followups_json", "followups"),
+            ("recent_changes_json", "recent_changes"),
+        ]:
+            try:
+                item[public_key] = json.loads(item.pop(json_key) or "[]")
+            except json.JSONDecodeError:
+                item[public_key] = []
         return item
 
     @staticmethod
@@ -2264,6 +3102,12 @@ def normalize_context_name(value: str) -> str:
     text = clean_context_name(value).lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_relationship_type(value: str) -> str:
+    text = str(value or "related").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text or "related"
 
 
 def context_candidates_from_text(text: str) -> list[str]:

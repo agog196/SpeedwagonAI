@@ -1,6 +1,6 @@
-# SpeedwagonAI Native Mac Core
+# SpeedwagonAI Native Local Beta
 
-This is the V17 developer native Mac core. It makes the SwiftUI app an assistant-first Mac surface, adds native meeting capture, managed meeting-bot beta controls, read-only Google Calendar context, local notifications, and still uses the Python backend as the source of truth.
+This is the V26 local beta native Mac app. It is a SwiftUI shell around the local Python backend with assistant, capture, task, suggestion, context review, notification, privacy, export, and wipe surfaces.
 
 Start the backend from the repo root:
 
@@ -14,11 +14,24 @@ Then run the native app from this directory:
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run SpeedwagonAI
 ```
 
+Build the unsigned local beta `.app` bundle:
+
+```bash
+./scripts/build-local-app.sh
+SPEEDWAGON_REPO_ROOT="$(cd ../.. && pwd)" open dist/SpeedwagonAI.app
+```
+
+This creates an unsigned local testing app. The signed private-beta flow below signs/notarizes and packages a DMG, but it still does not bundle Python, install an updater, or install a background daemon. Python 3.11 and this repo checkout must remain present.
+
 The app talks to:
 
 ```text
 http://127.0.0.1:8765
 ```
+
+V18 local API calls require a bearer token. The Python backend creates `data/local_api_token` by default; the Swift client reads `SPEEDWAGON_API_TOKEN`, `SPEEDWAGON_API_TOKEN_PATH`, or a nearby `data/local_api_token` file and sends it as `Authorization: Bearer <token>`.
+
+V26 local beta mode stores the OpenAI API key and local API token in macOS Keychain when configured through Settings. macOS may ask for the `login` Keychain password; that is the tester's Mac login password and lets SpeedwagonAI read or save its own `SpeedwagonAI.LocalBeta` items. Google and Recall configuration remain in the existing `.env`/OAuth-token flows.
 
 ## What It Includes
 
@@ -27,11 +40,15 @@ http://127.0.0.1:8765
 - Assistant-first dashboard with backend status, voice input, result panel, tasks, daily brief, commitments, and capture
 - Expanded assistant palette with native meeting capture controls and capture commands
 - Follow-through suggestions panel with Confirm, Snooze, and Dismiss controls
+- Editable local follow-up drafts after confirming email/follow-up suggestions, with explicit Gmail draft creation
+- Local beta Settings view for backend lifecycle, core Keychain secrets, logs, export, and wipe
+- First-run readiness diagnostics for repo root, Python 3.11, backend command, Keychain token/key presence, bundle mode, and notification status
+- Native-managed backend launch using `python3.11 -m speedwagon_ai.cli app --host 127.0.0.1 --port 8765`
 - Context chips on graph-linked tasks and suggestions
 - Brain + Cost panel for command, vision, and web-search model status
 - Capture panel with `Native system + mic` meeting recording, `Mic fallback`, voice-task recording, stop, and stop plus process
 - Meeting Bot Beta panel for configured provider status, paste-link join, consent confirmation, manual sync, and processing
-- Calendar panel for read-only Google Calendar status, sync, upcoming events, and meeting-prep context
+- Calendar panel for Google Calendar status, sync, explicit event creation, upcoming events, and meeting-prep context
 - Daily Brief Calendar cards for today's meetings, upcoming meetings, and prep context
 - Notifications panel for macOS permission status, local notification candidates, delivered counts, snooze, and dismiss
 - Native meeting capture that writes a ScreenCaptureKit system-audio WAV plus an AVFoundation microphone WAV, mixes the final WAV, and hands it back to Python for processing
@@ -43,6 +60,72 @@ http://127.0.0.1:8765
 - Complete and reopen task actions
 - Richer assistant result rendering for capabilities, tasks, meetings, drafts, markdown/context, and processed meeting output
 - Clear disconnected state with the exact backend command: `speedwagon app`
+
+## Local Beta Privacy Docs
+
+- [Local beta privacy policy](../../docs/privacy-policy-local-beta.md)
+- [Local beta terms](../../docs/terms-local-beta.md)
+
+The local beta is local-first. External services are optional and explicit: OpenAI for LLM-backed features, Google for OAuth draft/Calendar flows, Recall.ai for consent-confirmed bot sessions, and future web search only when explicitly enabled.
+
+## V25 Local App Verification Checklist
+
+1. Build the unsigned app:
+   ```bash
+   ./scripts/build-local-app.sh
+   ```
+2. Quit any manually started backend.
+3. Launch the app:
+   ```bash
+   SPEEDWAGON_REPO_ROOT="$(cd ../.. && pwd)" open dist/SpeedwagonAI.app
+   ```
+4. Verify the native app starts the Python backend and shows Connected.
+5. Save an OpenAI API key in Settings and verify the local API token path remains Keychain-managed.
+6. Open Settings, read the Keychain explanation, run Check Readiness, and verify Copy Diagnostics redacts secrets.
+7. Export local data and inspect the zip manifest.
+8. Test wipe against a temp data root before using it on real local beta data.
+9. Open Notifications, request permission in bundled mode, and verify Review opens the related suggestion without running an action.
+10. Quit the app and verify only the app-managed backend process is stopped.
+
+## V26 Signed Private Beta Packaging
+
+The signed pipeline is opt-in and uses environment variables. The unsigned `build-local-app.sh` script remains the local developer path.
+
+Required for signing:
+
+```bash
+export SPEEDWAGON_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID1234)"
+export SPEEDWAGON_TEAM_ID="TEAMID1234"
+```
+
+For notarization, use a notarytool keychain profile:
+
+```bash
+xcrun notarytool store-credentials speedwagon-notary --apple-id you@example.com --team-id TEAMID1234 --password app-specific-password
+export SPEEDWAGON_NOTARY_PROFILE="speedwagon-notary"
+```
+
+Or provide Apple notary credentials directly:
+
+```bash
+export SPEEDWAGON_NOTARY_APPLE_ID="you@example.com"
+export SPEEDWAGON_NOTARY_PASSWORD="app-specific-password"
+```
+
+Build, sign, notarize, staple, and package:
+
+```bash
+./scripts/build-signed-app.sh
+./scripts/notarize-app.sh
+./scripts/build-beta-dmg.sh
+```
+
+Outputs:
+
+- signed app: `dist/SpeedwagonAI-signed.app`
+- DMG: `dist/SpeedwagonAI-0.26.0-beta.dmg`
+
+The scripts fail fast with setup instructions if signing/notary environment variables are missing. Candidate entitlement areas to audit before future production packaging include microphone, screen capture, outgoing network access to localhost/provider APIs, user-selected file access for export, and notification permission behavior.
 
 ## Native Capture
 
@@ -76,9 +159,10 @@ The Calendar tab calls:
 
 - `GET /api/calendar/status`
 - `POST /api/calendar/sync`
+- `POST /api/calendar/events`
 - `GET /api/calendar/upcoming`
 
-Calendar is read-only in V16. It syncs the configured rolling window into local SQLite, enriches the Daily Brief, and shows prep cards by matching upcoming event details against local meetings, tasks, contexts, and suggestions.
+Calendar sync caches the configured rolling window into local SQLite, enriches the Daily Brief, and shows prep cards by matching upcoming event details against local meetings, tasks, contexts, and suggestions. Event creation is explicit from the Calendar tab or CLI; the app does not edit/delete events, schedule bots from Calendar, or write reminders.
 
 Configure from the repo root:
 
@@ -96,7 +180,7 @@ The Notifications tab requests macOS notification permission and schedules local
 
 Clicking a notification opens SpeedwagonAI and refreshes local state. Notifications never confirm, dismiss, send, or complete anything automatically.
 
-V17 does not run a background daemon after quit, does not launch at login, and does not write Apple Reminders.
+The current local beta does not run a background daemon after quit, does not launch at login, and does not write Apple Reminders.
 
 ## Meeting Bot Beta
 
@@ -112,7 +196,7 @@ Use `SPEEDWAGON_BOT_PROVIDER=fake` for local testing, or configure `SPEEDWAGON_B
 
 ## Current Limits
 
-V17 does not package, sign, notarize, or distribute the app. It does not launch the Python backend automatically, capture selected regions/windows, integrate Apple Reminders, write Calendar events, schedule bots from Calendar, or use provider webhooks yet.
+V26 keeps the local unsigned `.app` for developer testing and adds opt-in signed/notarized private-beta DMG packaging. It still does not bundle Python, install an updater, install a Launch Agent, capture selected regions/windows, integrate Apple Reminders, write Calendar events, schedule bots from Calendar, or use provider webhooks yet.
 
 Screenshots are captured only when you press the Screenshot button. The palette hides briefly and captures the active display based on the current mouse screen. macOS may require Screen Recording permission for the terminal/Xcode-launched app. Screenshot suggestions become pending actions and never create tasks automatically.
 

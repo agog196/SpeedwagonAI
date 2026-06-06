@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,17 +12,20 @@ from urllib.parse import parse_qs, urlparse
 from speedwagon_ai.assistant_actions import CAPABILITIES, run_action
 from speedwagon_ai.assistant_commands import cancel_pending_action, confirm_pending_action, execute_command
 from speedwagon_ai.capture import CaptureService, NativeCaptureService
-from speedwagon_ai.config import Settings
+from speedwagon_ai.config import Settings, local_api_token
 from speedwagon_ai.context import render_context
+from speedwagon_ai.email_composer import EmailDraftContent, ensure_email_signature
 from speedwagon_ai.extraction import Extractor
 from speedwagon_ai.integrations.calendar import GoogleCalendarService
-from speedwagon_ai.integrations.gmail import create_gmail_draft, preview_followup_email
+from speedwagon_ai.integrations.gmail import create_gmail_draft, create_gmail_draft_from_content, preview_followup_email
+from speedwagon_ai.intelligence import intelligence_status, refresh_daily_intelligence
 from speedwagon_ai.meeting_bot import MeetingBotService
 from speedwagon_ai.model_router import choose_model, cost_label, web_search_enabled
 from speedwagon_ai.output import MarkdownWriter
 from speedwagon_ai.processing import process_meeting
 from speedwagon_ai.screenshot_context import analyze_screenshot
 from speedwagon_ai.storage import Repository
+from speedwagon_ai.system_tools import export_data, log_exception, logs_status, privacy_status, wipe_data
 from speedwagon_ai.transcription import Transcriber
 from speedwagon_ai.voice_tasks import VoiceTaskRecorder
 
@@ -39,11 +43,15 @@ TASK_MUTATING_ACTIONS = {
     "snooze_suggestion",
 }
 
+MAX_JSON_BODY_BYTES = 1_000_000
+MAX_SCREENSHOT_BODY_BYTES = 8_000_000
+
 
 def run_app(settings: Settings, repo: Repository, host: str, port: int) -> None:
     handler = make_handler(settings, repo)
     server = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{port}"
+    settings.ensure_dirs()
     print(f"SpeedwagonAI app running at {url}")
     print("Press Ctrl+C to stop.")
     try:
@@ -55,18 +63,22 @@ def run_app(settings: Settings, repo: Repository, host: str, port: int) -> None:
 
 
 def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHandler]:
+    api_token = local_api_token(settings)
+
     class SpeedwagonHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             try:
+                if parsed.path.startswith("/api/") and not self._authorized():
+                    return
                 if parsed.path == "/":
-                    self._send_html(APP_HTML)
+                    self._send_html(APP_HTML, set_token_cookie=True)
                 elif parsed.path == "/app.css":
                     self._send_text(APP_CSS, "text/css")
                 elif parsed.path == "/app.js":
                     self._send_text(APP_JS, "application/javascript")
                 elif parsed.path == "/api/meetings":
-                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    limit = _limit_param(parse_qs(parsed.query).get("limit", ["20"])[0])
                     self._send_json({"meetings": [meeting_to_dict(m) for m in repo.list_meetings(limit=limit)]})
                 elif parsed.path.startswith("/api/meetings/"):
                     meeting_id = _meeting_id_from_path(parsed.path)
@@ -77,6 +89,9 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/context-graph":
                     query = parse_qs(parsed.query).get("query", [""])[0]
                     self._send_json(repo.context_graph(query))
+                elif parsed.path.startswith("/api/contexts/") and parsed.path.endswith("/detail"):
+                    context_id = _context_id_from_path(parsed.path)
+                    self._send_json(repo.context_detail(context_id))
                 elif parsed.path == "/api/commitments":
                     query = parse_qs(parsed.query)
                     status = query.get("status", [""])[0] or None
@@ -92,26 +107,44 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json({"items": items, "commitments": items})
                 elif parsed.path == "/api/daily-brief":
                     self._send_json(repo.daily_brief())
+                elif parsed.path == "/api/intelligence/daily":
+                    query = parse_qs(parsed.query)
+                    self._send_json(intelligence_status(repo, query.get("date", [""])[0] or None))
                 elif parsed.path == "/api/calendar/status":
                     self._send_json(GoogleCalendarService(settings, repo).status())
                 elif parsed.path == "/api/calendar/events":
                     query = parse_qs(parsed.query)
                     start = query.get("from", [""])[0] or None
                     end = query.get("to", [""])[0] or None
-                    limit = int(query.get("limit", ["50"])[0])
+                    if start:
+                        _iso_date(start[:10], "from")
+                    if end:
+                        _iso_date(end[:10], "to")
+                    limit = _limit_param(query.get("limit", ["50"])[0], maximum=100)
                     self._send_json(GoogleCalendarService(settings, repo).events(start_date=start, end_date=end, limit=limit))
                 elif parsed.path == "/api/calendar/upcoming":
-                    limit = int(parse_qs(parsed.query).get("limit", ["10"])[0])
+                    limit = _limit_param(parse_qs(parsed.query).get("limit", ["10"])[0], maximum=50)
                     self._send_json(GoogleCalendarService(settings, repo).upcoming(limit=limit))
                 elif parsed.path == "/api/suggestions":
-                    query = parse_qs(parsed.query)
+                    query = parse_qs(parsed.query, keep_blank_values=True)
                     status = query.get("status", ["open"])[0] or None
-                    limit = int(query.get("limit", ["20"])[0])
+                    limit = _limit_param(query.get("limit", ["20"])[0])
                     self._send_json({"suggestions": repo.list_suggestions(status=status, limit=limit)})
+                elif parsed.path.startswith("/api/suggestions/"):
+                    suggestion_id = _suggestion_id_from_path(parsed.path)
+                    self._send_json(suggestion_detail(repo, suggestion_id))
+                elif parsed.path == "/api/email/drafts":
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    status = query.get("status", ["local"])[0] or None
+                    limit = _limit_param(query.get("limit", ["20"])[0])
+                    self._send_json({"drafts": repo.list_followup_drafts(status=status, limit=limit)})
+                elif parsed.path.startswith("/api/email/drafts/"):
+                    draft_id = _draft_id_from_path(parsed.path)
+                    self._send_json({"draft": repo.get_followup_draft(draft_id)})
                 elif parsed.path == "/api/notifications/status":
                     self._send_json(repo.notification_status())
                 elif parsed.path == "/api/notifications/candidates":
-                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    limit = _limit_param(parse_qs(parsed.query).get("limit", ["20"])[0])
                     self._send_json({"candidates": repo.notification_candidates(limit=limit)})
                 elif parsed.path == "/api/assistant/capabilities":
                     self._send_json({"capabilities": CAPABILITIES})
@@ -121,13 +154,18 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/assistant/voice/status":
                     self._send_json(CaptureService(settings, repo).active_session("assistant_voice") or {"active": False})
                 elif parsed.path == "/api/tasks":
-                    status = parse_qs(parsed.query).get("status", ["open"])[0] or None
-                    include_done = parse_qs(parsed.query).get("include_done", ["false"])[0].lower() == "true"
+                    task_query = parse_qs(parsed.query, keep_blank_values=True)
+                    status = task_query.get("status", ["open"])[0] or None
+                    include_done = task_query.get("include_done", ["false"])[0].lower() == "true"
                     self._send_json({"tasks": repo.list_tasks(status=status, include_done=include_done)})
                 elif parsed.path == "/api/tasks/overdue":
                     self._send_json({"tasks": repo.overdue_tasks()})
                 elif parsed.path == "/api/settings":
                     self._send_json(settings_payload(settings))
+                elif parsed.path == "/api/system/logs":
+                    self._send_json(logs_status(settings))
+                elif parsed.path == "/api/system/privacy-status":
+                    self._send_json(privacy_status(settings, repo))
                 elif parsed.path == "/api/record/state":
                     self._send_json(recording_state(settings))
                 elif parsed.path == "/api/tasks/record/state":
@@ -149,7 +187,7 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/capture/bot/status":
                     self._send_json(MeetingBotService(settings, repo).status())
                 elif parsed.path == "/api/capture/bot/sessions":
-                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    limit = _limit_param(parse_qs(parsed.query).get("limit", ["20"])[0])
                     status = parse_qs(parsed.query).get("status", [""])[0] or None
                     self._send_json({"sessions": MeetingBotService(settings, repo).sessions(limit=limit, status=status)})
                 elif parsed.path.startswith("/api/capture/bot/sessions/"):
@@ -161,16 +199,26 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json(apple_reminders_status())
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Not found")
+            except RequestTooLarge as exc:
+                self._send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc))
+            except ValueError as exc:
+                self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            except KeyError as exc:
+                self._send_error(HTTPStatus.NOT_FOUND, str(exc))
             except Exception as exc:
-                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                log_exception(settings, exc, path=parsed.path)
+                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Internal SpeedwagonAI error. See local logs for details.")
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             try:
-                payload = self._read_json()
+                if parsed.path.startswith("/api/") and not self._authorized():
+                    return
+                payload = self._read_json(max_bytes=MAX_SCREENSHOT_BODY_BYTES if parsed.path == "/api/assistant/screenshot/analyze" else MAX_JSON_BODY_BYTES)
                 if parsed.path in {"/api/record/start", "/api/capture/local/start"}:
                     title = str(payload.get("title") or "").strip()
                     kind = str(payload.get("kind") or "meeting")
+                    _optional_choice(kind, "kind", {"meeting", "assistant_voice", "task_note"})
                     if parsed.path == "/api/record/start" and not title:
                         self._send_error(HTTPStatus.BAD_REQUEST, "title is required")
                         return
@@ -221,9 +269,13 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     )
                 elif parsed.path == "/api/capture/native/prepare":
                     repo.init()
+                    kind = _optional_choice(str(payload.get("kind") or "meeting"), "kind", {"meeting", "task_note", "assistant_voice"})
+                    title = str(payload.get("title") or "")
+                    if kind == "meeting":
+                        _required_string(title, "title")
                     session = NativeCaptureService(settings, repo).prepare(
-                        kind=str(payload.get("kind") or "meeting"),
-                        title=str(payload.get("title") or ""),
+                        kind=kind,
+                        title=title,
                         mode=str(payload.get("mode") or "system_mic"),
                     )
                     self._send_json({"session": session})
@@ -257,14 +309,25 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json({"session": session})
                 elif parsed.path == "/api/capture/bot/join":
                     repo.init()
+                    meeting_url = _required_string(payload.get("meeting_url"), "meeting_url")
+                    title = _required_string(payload.get("title"), "title")
                     self._send_json(
                         MeetingBotService(settings, repo).join(
-                            meeting_url=str(payload.get("meeting_url") or ""),
-                            title=str(payload.get("title") or ""),
+                            meeting_url=meeting_url,
+                            title=title,
                             join_at=_optional(payload.get("join_at")),
                             bot_name=_optional(payload.get("bot_name")),
                             consent_confirmed=bool(payload.get("consent_confirmed")),
                         )
+                    )
+                elif parsed.path == "/api/capture/bot/sessions/clear":
+                    repo.init()
+                    cleared_count = repo.clear_bot_sessions()
+                    self._send_json(
+                        {
+                            "cleared_count": cleared_count,
+                            "sessions": MeetingBotService(settings, repo).sessions(limit=20),
+                        }
                     )
                 elif parsed.path.startswith("/api/capture/bot/sessions/") and parsed.path.endswith("/sync"):
                     repo.init()
@@ -277,6 +340,51 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/calendar/sync":
                     repo.init()
                     self._send_json(GoogleCalendarService(settings, repo).sync())
+                elif parsed.path == "/api/calendar/events":
+                    repo.init()
+                    title = _required_string(payload.get("title"), "title")
+                    start_at = _required_string(payload.get("start_at"), "start_at")
+                    end_at = _required_string(payload.get("end_at"), "end_at")
+                    _iso_datetime(start_at, "start_at")
+                    _iso_datetime(end_at, "end_at")
+                    if _datetime_value(end_at) <= _datetime_value(start_at):
+                        raise ValueError("end_at must be after start_at")
+                    attendees = _attendees_payload(payload.get("attendees"))
+                    send_updates = str(payload.get("send_updates") or "none")
+                    self._send_json(
+                        GoogleCalendarService(settings, repo).create_event(
+                            title=title,
+                            start_at=start_at,
+                            end_at=end_at,
+                            calendar_id=str(payload.get("calendar_id") or "primary"),
+                            timezone_name=_optional(payload.get("timezone")),
+                            description=_optional(payload.get("description")),
+                            location=_optional(payload.get("location")),
+                            attendees=attendees,
+                            send_updates=send_updates,
+                        )
+                    )
+                elif parsed.path == "/api/system/export":
+                    output = _optional(payload.get("output_path") or payload.get("path"))
+                    if output and "\x00" in output:
+                        raise ValueError("output_path is invalid")
+                    self._send_json(export_data(settings, repo, Path(output) if output else None))
+                elif parsed.path == "/api/system/wipe":
+                    _required_string(payload.get("confirm"), "confirm")
+                    self._send_json(wipe_data(settings, repo, str(payload.get("confirm") or "")))
+                elif parsed.path == "/api/intelligence/daily/refresh":
+                    repo.init()
+                    refresh_date = _optional(payload.get("date"))
+                    if refresh_date:
+                        _iso_date(refresh_date, "date")
+                    self._send_json(
+                        refresh_daily_intelligence(
+                            settings,
+                            repo,
+                            refresh_date,
+                            top_suggestion_limit=_limit_param(payload.get("top_suggestion_limit") or 8, default=8, maximum=8),
+                        )
+                    )
                 elif parsed.path == "/api/assistant/voice/start":
                     repo.init()
                     session = CaptureService(settings, repo).start("assistant_voice")
@@ -289,16 +397,28 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                         MarkdownWriter(settings, repo).write_commitments()
                     result["assistant_response"] = response
                     self._send_json(result)
+                elif parsed.path == "/api/assistant/voice/transcribe":
+                    repo.init()
+                    result = CaptureService(settings, repo).stop(kind="assistant_voice")
+                    self._send_json(result)
                 elif parsed.path == "/api/tasks":
+                    text = _required_string(payload.get("text"), "text")
+                    due_date = _optional(payload.get("due_date"))
+                    if due_date:
+                        _iso_date(due_date, "due_date")
                     task = repo.create_task(
-                        str(payload.get("text") or ""),
+                        text,
                         owner=_optional(payload.get("owner")),
-                        due_date=_optional(payload.get("due_date")),
+                        due_date=due_date,
                         owed_to=_optional(payload.get("owed_to")),
                         project=_optional(payload.get("project")),
                     )
                     MarkdownWriter(settings, repo).write_commitments()
                     self._send_json({"task": task})
+                elif parsed.path == "/api/tasks/done/clear":
+                    cleared = repo.clear_done_tasks()
+                    MarkdownWriter(settings, repo).write_commitments()
+                    self._send_json({"cleared": cleared})
                 elif parsed.path == "/api/tasks/record/start":
                     state = CaptureService(settings, repo).start("task_note")
                     self._send_json(state)
@@ -338,6 +458,8 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     task = repo.cancel_task(task_id)
                     MarkdownWriter(settings, repo).write_commitments()
                     self._send_json({"task": task, "commitment": task})
+                elif parsed.path == "/api/suggestions/reviewed/clear":
+                    self._send_json({"cleared": repo.clear_reviewed_suggestions()})
                 elif parsed.path.startswith("/api/suggestions/") and parsed.path.endswith("/confirm"):
                     suggestion_id = _suggestion_id_from_path(parsed.path)
                     response = run_action(settings, repo, "confirm_suggestion", {"suggestion_id": suggestion_id})
@@ -349,12 +471,15 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json(run_action(settings, repo, "dismiss_suggestion", {"suggestion_id": suggestion_id}))
                 elif parsed.path.startswith("/api/suggestions/") and parsed.path.endswith("/snooze"):
                     suggestion_id = _suggestion_id_from_path(parsed.path)
+                    until = _optional(payload.get("until"))
+                    if until:
+                        _iso_date(until, "until")
                     self._send_json(
                         run_action(
                             settings,
                             repo,
                             "snooze_suggestion",
-                            {"suggestion_id": suggestion_id, "until": _optional(payload.get("until"))},
+                            {"suggestion_id": suggestion_id, "until": until},
                         )
                     )
                 elif parsed.path.startswith("/api/notifications/") and parsed.path.endswith("/mark-delivered"):
@@ -365,7 +490,70 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     self._send_json(repo.dismiss_notification(suggestion_id))
                 elif parsed.path.startswith("/api/notifications/") and parsed.path.endswith("/snooze"):
                     suggestion_id = _notification_id_from_path(parsed.path)
-                    self._send_json(repo.snooze_notification(suggestion_id, _optional(payload.get("until"))))
+                    until = _optional(payload.get("until"))
+                    if until:
+                        _iso_date(until, "until")
+                    self._send_json(repo.snooze_notification(suggestion_id, until))
+                elif parsed.path.startswith("/api/email/drafts/") and parsed.path.endswith("/update"):
+                    draft_id = _draft_id_from_path(parsed.path)
+                    subject = _optional(payload.get("subject"))
+                    body = str(payload.get("body")) if payload.get("body") is not None else None
+                    if subject is not None:
+                        _required_string(subject, "subject")
+                    if body is not None:
+                        _required_string(body, "body")
+                        body = ensure_email_signature(body)
+                    self._send_json(
+                        {
+                            "draft": repo.update_followup_draft(
+                                draft_id,
+                                recipient=_optional(payload.get("to") or payload.get("recipient")),
+                                subject=subject,
+                                body=body,
+                            )
+                        }
+                    )
+                elif parsed.path.startswith("/api/email/drafts/") and parsed.path.endswith("/gmail-draft"):
+                    draft_id = _draft_id_from_path(parsed.path)
+                    draft = repo.get_followup_draft(draft_id)
+                    if draft.get("status") == "gmail_draft" and draft.get("provider_draft_id"):
+                        self._send_json({"draft_id": draft.get("provider_draft_id"), "draft": draft, "reused": True})
+                        return
+                    recipient = _optional(payload.get("to") or payload.get("recipient") or draft.get("recipient"))
+                    if not recipient:
+                        self._send_error(HTTPStatus.BAD_REQUEST, "recipient is required")
+                        return
+                    subject = str(payload.get("subject") or draft.get("subject") or "Follow-up")
+                    body = str(payload.get("body") if payload.get("body") is not None else draft.get("body") or "")
+                    body = ensure_email_signature(body)
+                    updated = repo.update_followup_draft(draft_id, recipient=recipient, subject=subject, body=body)
+                    content = EmailDraftContent(
+                        subject=str(updated.get("subject") or subject),
+                        body=str(updated.get("body") or body),
+                        tone="edited",
+                        included_items=[str(value) for value in [updated.get("task_id"), updated.get("suggestion_id")] if value],
+                        provider="edited",
+                    )
+                    provider_draft_id = create_gmail_draft_from_content(settings, content, to=recipient)
+                    saved = repo.update_followup_draft(
+                        draft_id,
+                        status="gmail_draft",
+                        provider="gmail",
+                        provider_draft_id=provider_draft_id,
+                    )
+                    if saved.get("meeting_id"):
+                        repo.save_email_draft(
+                            meeting_id=int(saved["meeting_id"]),
+                            provider="gmail",
+                            provider_draft_id=provider_draft_id,
+                            recipient=recipient,
+                            subject=str(saved.get("subject") or subject),
+                            instruction=None,
+                            body=str(saved.get("body") or body),
+                            tone="edited",
+                            included_items=content.included_items,
+                        )
+                    self._send_json({"draft_id": provider_draft_id, "draft": saved})
                 elif parsed.path == "/api/integrations/apple/reminders":
                     self._send_error(
                         HTTPStatus.NOT_IMPLEMENTED,
@@ -374,8 +562,36 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                 elif parsed.path == "/api/actions":
                     action = str(payload.get("action") or "")
                     self._send_json(run_action(settings, repo, action, payload.get("payload") or {}))
+                elif parsed.path == "/api/contexts":
+                    repo.init()
+                    name = _required_string(payload.get("name"), "name")
+                    kind = str(payload.get("kind") or "person").strip().lower() or "person"
+                    if kind not in {"person", "project", "topic"}:
+                        raise ValueError("kind must be person, project, or topic")
+                    context = repo.ensure_context(name, kind=kind)
+                    profile_fields = {
+                        "email": _optional(payload.get("email")),
+                        "phone": _optional(payload.get("phone")),
+                        "role": _optional(payload.get("role")),
+                        "company": _optional(payload.get("company")),
+                        "notes": _optional(payload.get("notes")),
+                    }
+                    if any(value is not None for value in profile_fields.values()):
+                        repo.update_context_profile(int(context["id"]), **profile_fields)
+                    self._send_json(repo.context_detail(int(context["id"])))
+                elif parsed.path.startswith("/api/contexts/") and parsed.path.endswith("/profile"):
+                    context_id = _context_id_from_path(parsed.path)
+                    repo.update_context_profile(
+                        context_id,
+                        email=_optional(payload.get("email")),
+                        phone=_optional(payload.get("phone")),
+                        role=_optional(payload.get("role")),
+                        company=_optional(payload.get("company")),
+                        notes=_optional(payload.get("notes")),
+                    )
+                    self._send_json(repo.context_detail(context_id))
                 elif parsed.path == "/api/assistant/command":
-                    command = str(payload.get("command") or "")
+                    command = _required_string(payload.get("command"), "command")
                     response = execute_command(settings, repo, command)
                     if response.get("action") in TASK_MUTATING_ACTIONS:
                         MarkdownWriter(settings, repo).write_commitments()
@@ -390,6 +606,7 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     action_id = _assistant_action_id_from_path(parsed.path)
                     self._send_json(cancel_pending_action(repo, action_id))
                 elif parsed.path == "/api/assistant/screenshot/analyze":
+                    _required_string(payload.get("image_base64"), "image_base64")
                     self._send_json(
                         analyze_screenshot(
                             settings,
@@ -412,42 +629,92 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
                     )
                 elif parsed.path.startswith("/api/meetings/") and parsed.path.endswith("/email/preview"):
                     meeting_id = _meeting_id_from_path(parsed.path)
+                    recipient = _required_string(payload.get("to"), "to")
                     self._send_json(
                         preview_followup_email(
                             settings,
                             repo,
                             meeting_id,
-                            to=str(payload.get("to") or ""),
+                            to=recipient,
                             subject=_optional(payload.get("subject")),
                             instruction=str(payload.get("instruction") or ""),
                         )
                     )
                 elif parsed.path.startswith("/api/meetings/") and parsed.path.endswith("/email/draft"):
                     meeting_id = _meeting_id_from_path(parsed.path)
+                    recipient = _required_string(payload.get("to"), "to")
                     draft_id = create_gmail_draft(
                         settings,
                         repo,
                         meeting_id,
-                        to=str(payload.get("to") or ""),
+                        to=recipient,
                         subject=_optional(payload.get("subject")),
                         instruction=str(payload.get("instruction") or ""),
-                        body=_optional(payload.get("body")),
+                        body=ensure_email_signature(_optional(payload.get("body"))) if _optional(payload.get("body")) else None,
                     )
                     self._send_json({"draft_id": draft_id, "drafts": repo.email_drafts_for_meeting(meeting_id)})
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Not found")
+            except RequestTooLarge as exc:
+                self._send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc))
+            except ValueError as exc:
+                self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            except KeyError as exc:
+                self._send_error(HTTPStatus.NOT_FOUND, str(exc))
             except Exception as exc:
-                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                log_exception(settings, exc, path=parsed.path)
+                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Internal SpeedwagonAI error. See local logs for details.")
 
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-        def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or "0")
+        def _read_json(self, *, max_bytes: int = MAX_JSON_BODY_BYTES) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Content-Length is invalid") from exc
             if length == 0:
                 return {}
+            if length > max_bytes:
+                self.rfile.read(length)
+                raise RequestTooLarge(f"JSON body is too large. Limit is {max_bytes} bytes.")
             raw = self.rfile.read(length).decode("utf-8")
-            return json.loads(raw)
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Malformed JSON body") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            return payload
+
+        def _authorized(self) -> bool:
+            if not self._loopback_request_allowed():
+                self._send_error(HTTPStatus.FORBIDDEN, "Remote local API access is disabled.")
+                return False
+            auth = self.headers.get("Authorization", "")
+            if auth == f"Bearer {api_token}":
+                return True
+            cookie_header = self.headers.get("Cookie", "")
+            cookies = parse_cookie_header(cookie_header)
+            if cookies.get("speedwagon_api_token") == api_token:
+                return True
+            self._send_error(HTTPStatus.UNAUTHORIZED, "SpeedwagonAI API token is required.")
+            return False
+
+        def _loopback_request_allowed(self) -> bool:
+            if settings.allow_remote_api:
+                return True
+            host = (self.headers.get("Host") or "").split(":", 1)[0].strip().lower()
+            if host not in {"127.0.0.1", "localhost", "::1"}:
+                return False
+            for header in ["Origin", "Referer"]:
+                value = self.headers.get(header)
+                if not value:
+                    continue
+                parsed = urlparse(value)
+                if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+                    return False
+            return True
 
         def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
             data = json.dumps(payload, default=json_default).encode("utf-8")
@@ -457,14 +724,19 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
             self.end_headers()
             self.wfile.write(data)
 
-        def _send_html(self, text: str) -> None:
-            self._send_text(text, "text/html; charset=utf-8")
+        def _send_html(self, text: str, *, set_token_cookie: bool = False) -> None:
+            self._send_text(text, "text/html; charset=utf-8", set_token_cookie=set_token_cookie)
 
-        def _send_text(self, text: str, content_type: str) -> None:
+        def _send_text(self, text: str, content_type: str, *, set_token_cookie: bool = False) -> None:
             data = text.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            if set_token_cookie:
+                self.send_header(
+                    "Set-Cookie",
+                    f"speedwagon_api_token={api_token}; Path=/; SameSite=Strict; HttpOnly",
+                )
             self.end_headers()
             self.wfile.write(data)
 
@@ -472,6 +744,85 @@ def make_handler(settings: Settings, repo: Repository) -> type[BaseHTTPRequestHa
             self._send_json({"error": message}, status=status)
 
     return SpeedwagonHandler
+
+
+class RequestTooLarge(ValueError):
+    pass
+
+
+def _limit_param(value: Any, *, default: int = 20, maximum: int = 100) -> int:
+    if value in {None, ""}:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if parsed < 1 or parsed > maximum:
+        raise ValueError(f"limit must be between 1 and {maximum}")
+    return parsed
+
+
+def _required_string(value: Any, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} is required")
+    return text
+
+
+def _optional_choice(value: str, field: str, allowed: set[str]) -> str:
+    text = str(value or "").strip()
+    if text not in allowed:
+        raise ValueError(f"{field} must be one of: {', '.join(sorted(allowed))}")
+    return text
+
+
+def _iso_date(value: str, field: str) -> str:
+    text = str(value or "").strip()
+    try:
+        date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be YYYY-MM-DD") from exc
+    return text
+
+
+def _iso_datetime(value: str, field: str) -> str:
+    _datetime_value(value, field)
+    return str(value).strip()
+
+
+def _datetime_value(value: str, field: str = "datetime") -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} is required")
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 datetime") from exc
+
+
+def _attendees_payload(value: Any) -> list[str | dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attendees must be a list")
+    attendees: list[str | dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text and "@" not in text:
+                raise ValueError("attendee emails must contain @")
+            if text:
+                attendees.append(text)
+        elif isinstance(item, dict):
+            email = str(item.get("email") or "").strip()
+            if not email:
+                continue
+            if "@" not in email:
+                raise ValueError("attendee emails must contain @")
+            attendees.append(item)
+        else:
+            raise ValueError("attendees must contain emails or attendee objects")
+    return attendees
 
 
 def _meeting_id_from_path(path: str) -> int:
@@ -506,12 +857,28 @@ def _suggestion_id_from_path(path: str) -> int:
         raise ValueError("Invalid suggestion id") from exc
 
 
+def _context_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[2])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid context id") from exc
+
+
 def _notification_id_from_path(path: str) -> int:
     parts = [part for part in path.split("/") if part]
     try:
         return int(parts[2])
     except (IndexError, ValueError) as exc:
         raise ValueError("Invalid notification id") from exc
+
+
+def _draft_id_from_path(path: str) -> int:
+    parts = [part for part in path.split("/") if part]
+    try:
+        return int(parts[3])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Invalid draft id") from exc
 
 
 def _bot_session_id_from_path(path: str) -> int:
@@ -527,6 +894,16 @@ def _optional(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def parse_cookie_header(header: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in header.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        cookies[key.strip()] = value.strip()
+    return cookies
 
 
 def meeting_to_dict(meeting: Any) -> dict[str, Any]:
@@ -550,6 +927,30 @@ def meeting_detail(repo: Repository, meeting_id: int) -> dict[str, Any]:
         "email_drafts": repo.email_drafts_for_meeting(meeting_id),
         "transcript": transcript,
     }
+
+
+def suggestion_detail(repo: Repository, suggestion_id: int) -> dict[str, Any]:
+    suggestion = repo.get_suggestion(suggestion_id)
+    related_tasks = []
+    for task_id in suggestion.get("task_ids") or []:
+        try:
+            related_tasks.append(repo.get_task(int(task_id)))
+        except (KeyError, ValueError):
+            continue
+    return {
+        "suggestion": suggestion,
+        "related_tasks": related_tasks,
+        "followup_draft": repo.followup_draft_for_suggestion(suggestion_id),
+        "review_status": suggestion_review_status(suggestion),
+    }
+
+
+def suggestion_review_status(suggestion: dict[str, Any]) -> str:
+    if suggestion.get("status") in {"dismissed", "snoozed", "accepted", "retired", "archived"}:
+        return str(suggestion.get("status"))
+    if suggestion.get("retired_at"):
+        return "retired"
+    return "reviewable"
 
 
 def recording_state(settings: Settings) -> dict[str, Any]:
@@ -585,6 +986,10 @@ def settings_payload(settings: Settings) -> dict[str, Any]:
             "web_search": cost_label(web),
         },
         "web_search_enabled": web_search_enabled(),
+        "api_token_path": str(settings.api_token_path),
+        "log_dir": logs_status(settings)["log_dir"],
+        "app_log_path": logs_status(settings)["app_log_path"],
+        "backend_log_path": logs_status(settings)["backend_log_path"],
         "gmail_credentials_present": settings.gmail_credentials_path.exists(),
         "gmail_token_present": settings.gmail_token_path.exists(),
         "calendar_status": calendar_status.get("status"),
@@ -812,7 +1217,7 @@ APP_HTML = """<!doctype html>
         <div class="grid two">
           <section class="panel">
             <h2>Google Calendar</h2>
-            <p class="meta">Read-only. Syncs a limited local window for daily brief and prep context.</p>
+            <p class="meta">Syncs a limited local window for daily brief/prep context. Event creation is explicit.</p>
             <div class="row">
               <button id="calendar-sync">Sync Calendar</button>
               <button id="calendar-refresh">Refresh Calendar</button>

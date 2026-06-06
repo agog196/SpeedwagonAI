@@ -5,6 +5,8 @@ import SwiftUI
 final class AssistantPanelController {
     static let shared = AssistantPanelController()
 
+    static let contentSize = NSSize(width: 860, height: 560)
+
     private var panel: AssistantPanel?
     private var hostingController: NSHostingController<AnyView>?
 
@@ -25,7 +27,8 @@ final class AssistantPanelController {
     func show(state: AppState) {
         let panel = panel ?? makePanel(state: state)
         self.panel = panel
-        if let screen = activeScreen() {
+        panel.setContentSize(Self.contentSize)
+        if let screen = targetScreen(excluding: panel) {
             position(panel, on: screen)
         }
         panel.orderFrontRegardless()
@@ -43,7 +46,7 @@ final class AssistantPanelController {
         hostingController = hosting
 
         let panel = AssistantPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            contentRect: NSRect(origin: .zero, size: Self.contentSize),
             styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -70,18 +73,17 @@ final class AssistantPanelController {
         return panel
     }
 
-    private func activeScreen() -> NSScreen? {
-        let mouseLocation = NSEvent.mouseLocation
-        return NSScreen.screens.first { screen in
-            screen.frame.contains(mouseLocation)
-        } ?? NSScreen.main
+    private func targetScreen(excluding panel: NSPanel) -> NSScreen? {
+        NSApplication.shared.windows.first { window in
+            window !== panel && window.isVisible && window.screen != nil
+        }?.screen ?? NSScreen.main
     }
 
     private func position(_ panel: NSPanel, on screen: NSScreen) {
         let frame = screen.visibleFrame
         let size = panel.frame.size
         let x = frame.midX - size.width / 2
-        let y = frame.maxY - size.height - 72
+        let y = frame.midY - size.height / 2
         panel.setFrameOrigin(NSPoint(x: max(frame.minX + 16, x), y: max(frame.minY + 16, y)))
     }
 }

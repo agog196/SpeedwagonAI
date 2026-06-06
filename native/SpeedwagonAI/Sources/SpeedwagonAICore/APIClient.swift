@@ -17,13 +17,16 @@ public enum SpeedwagonAPIError: Error, LocalizedError, Equatable {
 public final class SpeedwagonAPIClient {
     public let baseURL: URL
     private let session: URLSession
+    private let apiToken: String?
 
     public init(
         baseURL: URL = URL(string: "http://127.0.0.1:8765")!,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        apiToken: String? = nil
     ) {
         self.baseURL = baseURL
         self.session = session
+        self.apiToken = apiToken ?? SpeedwagonAPIClient.loadLocalAPIToken()
     }
 
     public func fetchTasks() async throws -> [TaskItem] {
@@ -55,8 +58,39 @@ public final class SpeedwagonAPIClient {
         try await get(baseURL.appending(path: "/api/settings"))
     }
 
+    public func fetchSystemLogs() async throws -> SystemLogsResponse {
+        try await get(baseURL.appending(path: "/api/system/logs"))
+    }
+
+    public func fetchPrivacyStatus() async throws -> PrivacyStatusResponse {
+        try await get(baseURL.appending(path: "/api/system/privacy-status"))
+    }
+
+    public func exportData(outputPath: String? = nil) async throws -> SystemExportResponse {
+        try await post(baseURL.appending(path: "/api/system/export"), body: SystemExportRequest(outputPath: outputPath))
+    }
+
+    public func wipeData(confirm: String) async throws -> SystemWipeResponse {
+        try await post(baseURL.appending(path: "/api/system/wipe"), body: SystemWipeRequest(confirm: confirm))
+    }
+
     public func fetchDailyBrief() async throws -> DailyBriefResponse {
         try await get(baseURL.appending(path: "/api/daily-brief"))
+    }
+
+    public func fetchIntelligenceStatus(date: String? = nil) async throws -> IntelligenceStatusResponse {
+        var url = baseURL.appending(path: "/api/intelligence/daily")
+        if let date, !date.isEmpty {
+            url = url.appending(queryItems: [URLQueryItem(name: "date", value: date)])
+        }
+        return try await get(url)
+    }
+
+    public func refreshDailyIntelligence(date: String? = nil, topSuggestionLimit: Int = 8) async throws -> IntelligenceRefreshResponse {
+        try await post(
+            baseURL.appending(path: "/api/intelligence/daily/refresh"),
+            body: IntelligenceRefreshRequest(date: date, topSuggestionLimit: topSuggestionLimit)
+        )
     }
 
     public func fetchCalendarStatus() async throws -> CalendarStatusResponse {
@@ -65,6 +99,10 @@ public final class SpeedwagonAPIClient {
 
     public func syncCalendar() async throws -> CalendarSyncResponse {
         try await post(baseURL.appending(path: "/api/calendar/sync"), body: EmptyBody())
+    }
+
+    public func createCalendarEvent(_ request: CalendarCreateEventRequest) async throws -> CalendarCreateEventResponse {
+        try await post(baseURL.appending(path: "/api/calendar/events"), body: request)
     }
 
     public func fetchUpcomingCalendarEvents(limit: Int = 10) async throws -> [CalendarEvent] {
@@ -90,8 +128,46 @@ public final class SpeedwagonAPIClient {
     }
 
     public func fetchSuggestions() async throws -> [SuggestionItem] {
-        let response: SuggestionListResponse = try await get(baseURL.appending(path: "/api/suggestions"))
+        let url = baseURL.appending(path: "/api/suggestions")
+            .appending(queryItems: [
+                URLQueryItem(name: "status", value: ""),
+                URLQueryItem(name: "limit", value: "100")
+            ])
+        let response: SuggestionListResponse = try await get(url)
         return response.suggestions
+    }
+
+    public func fetchSuggestion(id: Int) async throws -> SuggestionItem {
+        (try await fetchSuggestionEnvelope(id: id)).suggestion
+    }
+
+    public func fetchSuggestionEnvelope(id: Int) async throws -> SuggestionEnvelope {
+        try await get(baseURL.appending(path: "/api/suggestions/\(id)"))
+    }
+
+    public func fetchFollowupDrafts(status: String? = nil, limit: Int = 40) async throws -> [FollowupDraft] {
+        let url = baseURL.appending(path: "/api/email/drafts")
+            .appending(queryItems: [
+                URLQueryItem(name: "status", value: status ?? ""),
+                URLQueryItem(name: "limit", value: String(limit))
+            ])
+        let response: FollowupDraftListResponse = try await get(url)
+        return response.drafts
+    }
+
+    public func updateFollowupDraft(id: Int, to: String?, subject: String?, body: String?) async throws -> FollowupDraft {
+        let response: FollowupDraftEnvelope = try await post(
+            baseURL.appending(path: "/api/email/drafts/\(id)/update"),
+            body: FollowupDraftUpdateRequest(to: to, subject: subject, body: body)
+        )
+        return response.draft
+    }
+
+    public func createGmailDraftFromFollowupDraft(id: Int, to: String?, subject: String?, body: String?) async throws -> FollowupDraftEnvelope {
+        try await post(
+            baseURL.appending(path: "/api/email/drafts/\(id)/gmail-draft"),
+            body: FollowupDraftUpdateRequest(to: to, subject: subject, body: body)
+        )
     }
 
     public func fetchNotificationStatus() async throws -> NotificationStatusResponse {
@@ -111,6 +187,18 @@ public final class SpeedwagonAPIClient {
         return try await get(url)
     }
 
+    public func fetchContextDetail(id: Int) async throws -> ContextDetailResponse {
+        try await get(baseURL.appending(path: "/api/contexts/\(id)/detail"))
+    }
+
+    public func createContext(request: ContextCreateRequest) async throws -> ContextDetailResponse {
+        try await post(baseURL.appending(path: "/api/contexts"), body: request)
+    }
+
+    public func updateContextProfile(id: Int, request: ContextProfileUpdateRequest) async throws -> ContextDetailResponse {
+        try await post(baseURL.appending(path: "/api/contexts/\(id)/profile"), body: request)
+    }
+
     public func fetchCaptureStatus() async throws -> CaptureSession {
         try await get(baseURL.appending(path: "/api/capture/status"))
     }
@@ -126,6 +214,10 @@ public final class SpeedwagonAPIClient {
     public func fetchBotSessions() async throws -> [BotSession] {
         let response: BotSessionListResponse = try await get(baseURL.appending(path: "/api/capture/bot/sessions"))
         return response.sessions
+    }
+
+    public func clearBotSessions() async throws -> BotSessionClearResponse {
+        try await post(baseURL.appending(path: "/api/capture/bot/sessions/clear"), body: EmptyBody())
     }
 
     public func joinBotSession(meetingUrl: String, title: String, consentConfirmed: Bool) async throws -> BotJoinResponse {
@@ -201,6 +293,10 @@ public final class SpeedwagonAPIClient {
         try await post(baseURL.appending(path: "/api/assistant/voice/stop"), body: EmptyBody())
     }
 
+    public func transcribeAssistantVoice() async throws -> AssistantVoiceTranscriptResponse {
+        try await post(baseURL.appending(path: "/api/assistant/voice/transcribe"), body: EmptyBody())
+    }
+
     public func runCommand(_ command: String) async throws -> AssistantCommandResponse {
         let url = baseURL.appending(path: "/api/assistant/command")
         return try await post(url, body: AssistantCommandRequest(command: command))
@@ -222,6 +318,10 @@ public final class SpeedwagonAPIClient {
         return response.suggestion
     }
 
+    public func confirmSuggestionEnvelope(id: Int) async throws -> SuggestionEnvelope {
+        try await post(baseURL.appending(path: "/api/suggestions/\(id)/confirm"), body: EmptyBody())
+    }
+
     public func dismissSuggestion(id: Int) async throws -> SuggestionItem {
         let url = baseURL.appending(path: "/api/suggestions/\(id)/dismiss")
         let response: SuggestionEnvelope = try await post(url, body: EmptyBody())
@@ -232,6 +332,10 @@ public final class SpeedwagonAPIClient {
         let url = baseURL.appending(path: "/api/suggestions/\(id)/snooze")
         let response: SuggestionEnvelope = try await post(url, body: SuggestionSnoozeRequest(until: until))
         return response.suggestion
+    }
+
+    public func clearReviewedSuggestions() async throws -> ClearSuggestionsResponse {
+        try await post(baseURL.appending(path: "/api/suggestions/reviewed/clear"), body: EmptyBody())
     }
 
     public func markNotificationDelivered(id: Int) async throws -> NotificationEnvelope {
@@ -271,21 +375,34 @@ public final class SpeedwagonAPIClient {
         return response.task
     }
 
+    public func clearDoneTasks() async throws -> ClearDoneTasksResponse {
+        try await post(baseURL.appending(path: "/api/tasks/done/clear"), body: EmptyBody())
+    }
+
     private func get<T: Decodable>(_ url: URL) async throws -> T {
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await session.data(for: request(url: url, method: "GET"))
         try validate(response: response, data: data)
         return try SpeedwagonJSON.decoder.decode(T.self, from: data)
     }
 
     private func post<T: Decodable, Body: Encodable>(_ url: URL, body: Body) async throws -> T {
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        var request = request(url: url, method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try SpeedwagonJSON.encoder.encode(body)
 
         let (data, response) = try await session.data(for: request)
         try validate(response: response, data: data)
         return try SpeedwagonJSON.decoder.decode(T.self, from: data)
+    }
+
+    private func request(url: URL, method: String) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        let token = apiToken ?? SpeedwagonAPIClient.loadLocalAPIToken()
+        if let token, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
     private func validate(response: URLResponse, data: Data) throws {
@@ -297,6 +414,35 @@ public final class SpeedwagonAPIClient {
             let message = String(data: data, encoding: .utf8) ?? "No response body"
             throw SpeedwagonAPIError.httpStatus(httpResponse.statusCode, message)
         }
+    }
+
+    static func loadLocalAPIToken() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        if let token = environment["SPEEDWAGON_API_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            return token
+        }
+
+        var candidates: [String] = []
+        if let configuredPath = environment["SPEEDWAGON_API_TOKEN_PATH"], !configuredPath.isEmpty {
+            candidates.append(configuredPath)
+        }
+        var directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for _ in 0..<6 {
+            candidates.append(directory.appending(path: "data/local_api_token").path)
+            directory.deleteLastPathComponent()
+        }
+
+        for path in candidates {
+            if let value = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
+        if let token = try? KeychainStore.shared.load(account: KeychainAccount.localAPIToken),
+           !token.isEmpty {
+            return token
+        }
+        return nil
     }
 }
 

@@ -82,6 +82,30 @@ final class APIClientDecodingTests: XCTestCase {
             }
           ],
           "meetings": [],
+          "relationships": [
+            {
+              "id": 2,
+              "source_context": {
+                "id": 5,
+                "name": "Megan",
+                "normalized_name": "megan",
+                "kind": "person"
+              },
+              "target_context": {
+                "id": 4,
+                "name": "DairyMGT",
+                "normalized_name": "dairymgt",
+                "kind": "project"
+              },
+              "relationship_type": "owns_followup",
+              "evidence": "Megan owns DairyMGT updates.",
+              "confidence": 0.91,
+              "source_meeting_id": 7,
+              "source_meeting_title": "DairyMGT planning",
+              "created_at": "2026-06-04T10:00:00Z",
+              "updated_at": "2026-06-04T10:00:00Z"
+            }
+          ],
           "suggestions": [
             {
               "id": 6,
@@ -120,6 +144,7 @@ final class APIClientDecodingTests: XCTestCase {
         XCTAssertEqual(graph.contexts.first?.name, "DairyMGT")
         XCTAssertEqual(graph.tasks.first?.contexts?.first?.name, "DairyMGT")
         XCTAssertEqual(graph.suggestions.first?.displayContext, "DairyMGT")
+        XCTAssertEqual(graph.relationships?.first?.displayLine, "Megan owns followup DairyMGT")
 
         let listJSON = """
         {
@@ -162,6 +187,209 @@ final class APIClientDecodingTests: XCTestCase {
         XCTAssertEqual(list.suggestions.first?.taskIds, [8, 9])
         XCTAssertEqual(list.suggestions.first?.notificationStatus, "candidate")
         XCTAssertEqual(list.suggestions.first?.notificationReason, "Related work looks ready for follow-up.")
+
+        let detailJSON = """
+        {
+          "suggestion": {
+            "id": 6,
+            "title": "Draft follow-up for DairyMGT",
+            "reason": "All other open work linked to DairyMGT appears resolved.",
+            "status": "accepted",
+            "confidence": 0.82,
+            "context_id": 4,
+            "context_name": "DairyMGT",
+            "context_kind": "project",
+            "context": {
+              "id": 4,
+              "name": "DairyMGT",
+              "kind": "project"
+            },
+            "proposed_action": "draft_email_from_context",
+            "payload": { "context_id": 4, "task_id": 9 },
+            "task_ids": [9],
+            "meeting_ids": [],
+            "source_fingerprint": "draft_email_from_context|context:4|tasks:9",
+            "retired_at": null,
+            "next_notify_at": null,
+            "last_notified_at": null,
+            "notification_reason": "Related work looks ready for follow-up.",
+            "notification_status": "accepted",
+            "snoozed_until": null,
+            "created_at": "2026-06-04T10:00:00Z",
+            "updated_at": "2026-06-04T10:05:00Z"
+          },
+          "related_tasks": [
+            {
+              "id": 9,
+              "text": "Email Megan about DairyMGT",
+              "project": "DairyMGT",
+              "due_date": null,
+              "status": "open",
+              "source": "manual"
+            }
+          ],
+          "followup_draft": {
+            "id": 3,
+            "suggestion_id": 6,
+            "task_id": 9,
+            "context_id": 4,
+            "meeting_id": null,
+            "provider": "gmail",
+            "provider_draft_id": "gmail-draft-1",
+            "recipient": "megan@example.com",
+            "subject": "DairyMGT follow-up",
+            "body": "Hi Megan",
+            "status": "gmail_draft",
+            "source": "suggestion",
+            "context_name": "DairyMGT",
+            "task_text": "Email Megan about DairyMGT",
+            "meeting_title": null,
+            "created_at": "2026-06-04T10:04:00Z",
+            "updated_at": "2026-06-04T10:05:00Z"
+          },
+          "review_status": "accepted"
+        }
+        """.data(using: .utf8)!
+
+        let detail = try SpeedwagonJSON.decoder.decode(SuggestionEnvelope.self, from: detailJSON)
+
+        XCTAssertEqual(detail.suggestion.id, 6)
+        XCTAssertEqual(detail.relatedTasks?.first?.id, 9)
+        XCTAssertEqual(detail.followupDraft?.providerDraftId, "gmail-draft-1")
+        XCTAssertEqual(detail.reviewStatus, "accepted")
+
+        let contextDetailJSON = """
+        {
+          "context": {
+            "id": 4,
+            "name": "DairyMGT",
+            "normalized_name": "dairymgt",
+            "kind": "project"
+          },
+          "related_contexts": [
+            {
+              "id": 5,
+              "name": "Megan",
+              "normalized_name": "megan",
+              "kind": "person"
+            }
+          ],
+          "relationships": [
+            {
+              "id": 2,
+              "source_context": {
+                "id": 5,
+                "name": "Megan",
+                "normalized_name": "megan",
+                "kind": "person"
+              },
+              "target_context": {
+                "id": 4,
+                "name": "DairyMGT",
+                "normalized_name": "dairymgt",
+                "kind": "project"
+              },
+              "relationship_type": "owns_followup",
+              "evidence": "Megan owns DairyMGT updates.",
+              "confidence": 0.91,
+              "source_meeting_id": 7,
+              "source_meeting_title": "DairyMGT planning",
+              "created_at": "2026-06-04T10:00:00Z",
+              "updated_at": "2026-06-04T10:00:00Z"
+            }
+          ],
+          "tasks": [
+            {
+              "id": 9,
+              "text": "Email Megan about DairyMGT",
+              "project": "DairyMGT",
+              "due_date": null,
+              "status": "open",
+              "source": "manual"
+            }
+          ],
+          "meetings": [
+            {
+              "id": 7,
+              "title": "DairyMGT planning",
+              "started_at": "2026-06-04T10:00:00Z",
+              "ended_at": null,
+              "summary": "Reviewed launch updates.",
+              "source_type": "manual"
+            }
+          ],
+          "decisions": [
+            {
+              "id": 8,
+              "meeting_id": 7,
+              "text": "Use staged rollout.",
+              "created_at": "2026-06-04T10:00:00Z"
+            }
+          ],
+          "suggestions": [
+            {
+              "id": 6,
+              "title": "Draft follow-up for DairyMGT",
+              "reason": "All other open work linked to DairyMGT appears resolved.",
+              "status": "snoozed",
+              "confidence": 0.82,
+              "context_id": 4,
+              "context_name": "DairyMGT",
+              "context_kind": "project",
+              "context": {
+                "id": 4,
+                "name": "DairyMGT",
+                "kind": "project"
+              },
+              "proposed_action": "draft_email_from_context",
+              "payload": { "context_id": 4, "task_id": 9 },
+              "task_ids": [9],
+              "meeting_ids": [7],
+              "source_fingerprint": "draft_email_from_context|context:4|tasks:9",
+              "retired_at": null,
+              "next_notify_at": "2026-06-09",
+              "last_notified_at": null,
+              "notification_reason": "Related work looks ready for follow-up.",
+              "notification_status": "snoozed",
+              "snoozed_until": "2026-06-09",
+              "created_at": "2026-06-04T10:00:00Z",
+              "updated_at": "2026-06-04T10:05:00Z"
+            }
+          ],
+          "followup_drafts": [
+            {
+              "id": 3,
+              "suggestion_id": 6,
+              "task_id": 9,
+              "context_id": 4,
+              "meeting_id": 7,
+              "provider": "local",
+              "provider_draft_id": null,
+              "recipient": "megan@example.com",
+              "subject": "DairyMGT follow-up",
+              "body": "Hi Megan",
+              "status": "local",
+              "source": "suggestion",
+              "context_name": "DairyMGT",
+              "task_text": "Email Megan about DairyMGT",
+              "meeting_title": "DairyMGT planning",
+              "created_at": "2026-06-04T10:04:00Z",
+              "updated_at": "2026-06-04T10:05:00Z"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let contextDetail = try SpeedwagonJSON.decoder.decode(ContextDetailResponse.self, from: contextDetailJSON)
+
+        XCTAssertEqual(contextDetail.context.name, "DairyMGT")
+        XCTAssertEqual(contextDetail.relatedContexts.first?.name, "Megan")
+        XCTAssertEqual(contextDetail.relationships.first?.displayLine, "Megan owns followup DairyMGT")
+        XCTAssertEqual(contextDetail.tasks.first?.id, 9)
+        XCTAssertEqual(contextDetail.meetings.first?.title, "DairyMGT planning")
+        XCTAssertEqual(contextDetail.decisions.first?.displayText, "Use staged rollout.")
+        XCTAssertEqual(contextDetail.suggestions.first?.status, "snoozed")
+        XCTAssertEqual(contextDetail.followupDrafts.first?.subject, "DairyMGT follow-up")
     }
 
     func testDecodesNotificationPayloads() throws {
@@ -262,7 +490,44 @@ final class APIClientDecodingTests: XCTestCase {
           "source": "rules",
           "summary": "Found 1 task.",
           "command": "what is overdue",
+          "suggested_commands": ["daily brief"],
           "result": {
+            "suggested_commands": ["daily brief"],
+            "created": false,
+            "reused": true,
+            "next_step": "Review the existing task.",
+            "decisions": [
+              {
+                "id": 8,
+                "meeting_id": 2,
+                "text": "Use staged onboarding",
+                "created_at": "2026-06-04T10:00:00Z"
+              }
+            ],
+            "relationships": [
+              {
+                "id": 2,
+                "source_context": {
+                  "id": 5,
+                  "name": "Alex",
+                  "normalized_name": "alex",
+                  "kind": "person"
+                },
+                "target_context": {
+                  "id": 6,
+                  "name": "Onboarding",
+                  "normalized_name": "onboarding",
+                  "kind": "topic"
+                },
+                "relationship_type": "owns",
+                "evidence": "Alex owns onboarding.",
+                "confidence": 0.9,
+                "source_meeting_id": 2,
+                "source_meeting_title": "Onboarding",
+                "created_at": "2026-06-04T10:00:00Z",
+                "updated_at": "2026-06-04T10:00:00Z"
+              }
+            ],
             "tasks": [
               {
                 "id": 4,
@@ -289,6 +554,13 @@ final class APIClientDecodingTests: XCTestCase {
         XCTAssertEqual(response.explanation, "Rules parser matched.")
         XCTAssertEqual(response.source, "rules")
         XCTAssertEqual(response.result?.tasks?.first?.id, 4)
+        XCTAssertEqual(response.suggestedCommands?.first, "daily brief")
+        XCTAssertEqual(response.result?.suggestedCommands?.first, "daily brief")
+        XCTAssertEqual(response.result?.created, false)
+        XCTAssertEqual(response.result?.reused, true)
+        XCTAssertEqual(response.result?.nextStep, "Review the existing task.")
+        XCTAssertEqual(response.result?.decisions?.first?.displayText, "Use staged onboarding")
+        XCTAssertEqual(response.result?.relationships?.first?.displayLine, "Alex owns Onboarding")
         XCTAssertEqual(response.summary, "Found 1 task.")
     }
 
@@ -333,6 +605,78 @@ final class APIClientDecodingTests: XCTestCase {
         XCTAssertEqual(response.pendingActionId, 14)
         XCTAssertEqual(response.result?.pendingAction?.id, 14)
         XCTAssertEqual(response.result?.pendingAction?.status, "pending")
+    }
+
+    func testDecodesToolAssistedAssistantResultFields() throws {
+        let json = """
+        {
+          "supported": true,
+          "action": "create_local_email_draft",
+          "category": "email",
+          "requires_confirmation": true,
+          "payload": {
+            "recipient": "john@example.com",
+            "subject": "Request for v8 Files",
+            "body": "Hi John"
+          },
+          "confidence": 0.84,
+          "pending_action_id": 24,
+          "explanation": "Retrieved local context first.",
+          "safety_notes": ["Writes require confirmation."],
+          "source": "tool_assisted_local",
+          "summary": "Draft preview ready.",
+          "command": "draft an email to John asking for v8 files",
+          "result": {
+            "assistant_message": "Draft preview ready for John.",
+            "clarification_required": false,
+            "evidence": [
+              {
+                "kind": "task",
+                "id": 34,
+                "title": "Ask John to send v8 files",
+                "subtitle": "open"
+              }
+            ],
+            "draft_preview": {
+              "to": "john@example.com",
+              "subject": "Request for v8 Files",
+              "body": "Hi John",
+              "tone": "neutral",
+              "provider": "fallback",
+              "included_items": ["task:34"]
+            },
+            "pending_action": {
+              "id": 24,
+              "command": "draft an email to John asking for v8 files",
+              "action": "create_local_email_draft",
+              "category": "email",
+              "payload": {
+                "recipient": "john@example.com",
+                "subject": "Request for v8 Files",
+                "body": "Hi John"
+              },
+              "confidence": 0.84,
+              "source": "tool_assisted_local",
+              "explanation": "Previewed first.",
+              "safety_notes": [],
+              "status": "pending",
+              "created_at": "2026-06-03T10:00:00Z",
+              "updated_at": "2026-06-03T10:00:00Z",
+              "expires_at": null
+            }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let response = try SpeedwagonJSON.decoder.decode(AssistantCommandResponse.self, from: json)
+
+        XCTAssertEqual(response.action, "create_local_email_draft")
+        XCTAssertEqual(response.result?.assistantMessage, "Draft preview ready for John.")
+        XCTAssertEqual(response.result?.clarificationRequired, false)
+        XCTAssertEqual(response.result?.evidence?.first?.displayLine, "task #34: Ask John to send v8 files · open")
+        XCTAssertEqual(response.result?.draftPreview?.to, "john@example.com")
+        XCTAssertEqual(response.result?.draftPreview?.includedItems?.first, "task:34")
+        XCTAssertEqual(response.result?.pendingAction?.action, "create_local_email_draft")
     }
 
     func testDecodesAssistantCapabilitiesResponse() throws {
@@ -515,6 +859,21 @@ final class APIClientDecodingTests: XCTestCase {
         let json = """
         {
           "date": "2026-06-03",
+          "synthesis": {
+            "id": 2,
+            "date": "2026-06-03",
+            "summary": "Two threads need attention.",
+            "risks": ["Launch recap is overdue."],
+            "dropped_threads": ["Design approval has not moved."],
+            "followups": ["Follow up with Megan."],
+            "recent_changes": ["DairyMGT review moved forward."],
+            "provider": "fallback",
+            "model": null,
+            "generated_at": "2026-06-03T12:00:00Z",
+            "input_fingerprint": "abc",
+            "created_at": "2026-06-03T12:00:00Z",
+            "updated_at": "2026-06-03T12:00:00Z"
+          },
           "overdue": [],
           "today": [],
           "upcoming": [],
@@ -585,12 +944,52 @@ final class APIClientDecodingTests: XCTestCase {
         let response = try SpeedwagonJSON.decoder.decode(DailyBriefResponse.self, from: json)
 
         XCTAssertEqual(response.date, "2026-06-03")
+        XCTAssertEqual(response.synthesis?.summary, "Two threads need attention.")
+        XCTAssertEqual(response.synthesis?.droppedThreads.first, "Design approval has not moved.")
         XCTAssertEqual(response.counts["today"], 0)
         XCTAssertTrue(response.recommendedFollowups.isEmpty)
         XCTAssertEqual(response.calendarToday?.first?.title, "DairyMGT review")
         XCTAssertEqual(response.calendarToday?.first?.attendees?.first?.displayName, "Megan")
         XCTAssertEqual(response.meetingPrep?.first?.query, "DairyMGT Megan")
         XCTAssertEqual(response.notificationCandidates?.first?.notificationStatus, "candidate")
+    }
+
+    func testDecodesDailyIntelligenceResponses() throws {
+        let json = """
+        {
+          "status": "refreshed",
+          "date": "2026-06-03",
+          "synthesis": {
+            "date": "2026-06-03",
+            "summary": "One risk.",
+            "risks": ["Send recap is overdue."],
+            "dropped_threads": [],
+            "followups": ["Email Megan."],
+            "recent_changes": [],
+            "provider": "fallback",
+            "generated_at": "2026-06-03T12:00:00Z"
+          },
+          "updated_suggestions": [],
+          "input_fingerprint": "abc"
+        }
+        """.data(using: .utf8)!
+
+        let refreshed = try SpeedwagonJSON.decoder.decode(IntelligenceRefreshResponse.self, from: json)
+
+        XCTAssertEqual(refreshed.status, "refreshed")
+        XCTAssertEqual(refreshed.synthesis.risks.first, "Send recap is overdue.")
+
+        let statusJSON = """
+        {
+          "date": "2026-06-03",
+          "cached": null,
+          "latest": null,
+          "manual_refresh_required": true,
+          "note": "Daily intelligence is generated only when explicitly refreshed."
+        }
+        """.data(using: .utf8)!
+        let status = try SpeedwagonJSON.decoder.decode(IntelligenceStatusResponse.self, from: statusJSON)
+        XCTAssertEqual(status.manualRefreshRequired, true)
     }
 
     func testDecodesCalendarResponses() throws {
@@ -603,6 +1002,8 @@ final class APIClientDecodingTests: XCTestCase {
           "credentials_present": true,
           "token_present": true,
           "calendar_scope_present": true,
+          "calendar_write_scope_present": true,
+          "write_enabled": true,
           "calendar_ids": ["primary"],
           "sync_days_back": 14,
           "sync_days_forward": 30
@@ -645,15 +1046,42 @@ final class APIClientDecodingTests: XCTestCase {
           ]
         }
         """.data(using: .utf8)!
+        let createJSON = """
+        {
+          "status": "created",
+          "provider": "google",
+          "calendar_id": "primary",
+          "html_link": "https://calendar.google.com/event?eid=event-3",
+          "send_updates": "none",
+          "event": {
+            "id": 3,
+            "provider": "google",
+            "provider_event_id": "event-3",
+            "calendar_id": "primary",
+            "title": "Pilot planning",
+            "description_snippet": "Discuss next steps",
+            "start_at": "2026-06-08T10:00:00-07:00",
+            "end_at": "2026-06-08T10:30:00-07:00",
+            "timezone": "America/Los_Angeles",
+            "attendees": [{"email": "alex@example.com"}],
+            "html_link": "https://calendar.google.com/event?eid=event-3",
+            "last_synced_at": "2026-06-05T10:00:00Z"
+          }
+        }
+        """.data(using: .utf8)!
 
         let status = try SpeedwagonJSON.decoder.decode(CalendarStatusResponse.self, from: statusJSON)
         let events = try SpeedwagonJSON.decoder.decode(CalendarEventListResponse.self, from: eventsJSON)
         let sync = try SpeedwagonJSON.decoder.decode(CalendarSyncResponse.self, from: syncJSON)
+        let created = try SpeedwagonJSON.decoder.decode(CalendarCreateEventResponse.self, from: createJSON)
 
         XCTAssertTrue(status.enabled)
+        XCTAssertEqual(status.writeEnabled, true)
         XCTAssertEqual(status.calendarIds, ["primary"])
         XCTAssertEqual(events.events.first?.meetingUrl, "https://meet.google.com/abc-defg-hij")
         XCTAssertEqual(sync.syncedCount, 1)
+        XCTAssertEqual(created.event.title, "Pilot planning")
+        XCTAssertEqual(created.htmlLink, "https://calendar.google.com/event?eid=event-3")
     }
 
     func testDecodesSettingsResponse() throws {
